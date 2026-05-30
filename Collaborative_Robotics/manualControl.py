@@ -34,9 +34,9 @@ import cv2
 # ---------------------------------------------------------------------------
 # How far the arm moves per key press. Start small for safety.
 # ---------------------------------------------------------------------------
-STEP_XY = 10     # mm per press for W/S/A/D
-STEP_Z  = 10     # mm per press for Q/E
-STEP_R  = 15     # degrees per press for Z/C
+STEP_XY = 30     # mm per press for W/S/A/D
+STEP_Z  = 30     # mm per press for Q/E
+STEP_R  = 45     # degrees per press for Z/C
 
 # ---------------------------------------------------------------------------
 # Soft limits - stop the arm from being driven somewhere that hits the table
@@ -120,7 +120,7 @@ def manual_control_loop(api, cap, window_name="Detection"):
         _draw_overlay(frame, x, y, z, r, gripper_closed)
         cv2.imshow(window_name, frame)
 
-        key = cv2.waitKey(30) & 0xFF   # 30ms wait = responsive but not maxed out
+        key = cv2.waitKey(10) & 0xFF   # 10ms wait = responsive but not maxed out
 
         if key == 255:                 # no key pressed this frame
             continue
