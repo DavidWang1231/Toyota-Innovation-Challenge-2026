@@ -179,25 +179,34 @@ HTML = """<!DOCTYPE html>
                    letter-spacing: .3em; text-transform: uppercase; }
   #splash h1 { margin: 0; font-size: 36px; font-weight: 700; color: var(--text); }
   #splash h1 span { color: var(--accent); }
-  #splash .pulse-wrap { position: relative; width: 220px; height: 220px;
-                         display: flex; align-items: center; justify-content: center; }
+  #splash .pulse-wrap { position: absolute; inset: 0;
+                         display: flex; align-items: center; justify-content: center;
+                         pointer-events: none; overflow: hidden; z-index: 0; }
   #splash .pulse-wrap .ring {
-      position: absolute; inset: 0; border: 2px solid var(--accent);
+      position: absolute; top: 50%; left: 50%;
+      width: 120px; height: 120px;
+      margin-top: -60px; margin-left: -60px;
+      border: 2px solid var(--accent);
       border-radius: 50%; opacity: 0;
-      animation: radar 2.4s ease-out infinite;
+      animation: radar 4s ease-out infinite;
   }
   #splash .pulse-wrap .ring:nth-child(2) { animation-delay: 0.8s; }
   #splash .pulse-wrap .ring:nth-child(3) { animation-delay: 1.6s; }
+  #splash .pulse-wrap .ring:nth-child(4) { animation-delay: 2.4s; }
+  #splash .pulse-wrap .ring:nth-child(5) { animation-delay: 3.2s; }
   #splash .pulse-wrap .core {
-      width: 18px; height: 18px; border-radius: 50%;
+      width: 24px; height: 24px; border-radius: 50%;
       background: var(--accent);
-      box-shadow: 0 0 24px var(--accent);
+      box-shadow: 0 0 36px var(--accent);
       animation: corepulse 1.6s ease-in-out infinite;
+      z-index: 1;
   }
+  /* All splash content sits above the radar */
+  #splash > *:not(.pulse-wrap) { position: relative; z-index: 2; }
   @keyframes radar {
-      0%   { transform: scale(0.35); opacity: 0.9; }
-      80%  { opacity: 0.05; }
-      100% { transform: scale(1.0);  opacity: 0; }
+      0%   { transform: scale(0.2);  opacity: 0.85; }
+      80%  { opacity: 0.06; }
+      100% { transform: scale(20);   opacity: 0; }
   }
   @keyframes corepulse {
       0%, 100% { transform: scale(1);   filter: brightness(1); }
@@ -279,6 +288,8 @@ HTML = """<!DOCTYPE html>
     <div class="ring"></div>
     <div class="ring"></div>
     <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
     <div class="core"></div>
   </div>
   <button id="connectBtn">CONNECT</button>
@@ -291,6 +302,7 @@ HTML = """<!DOCTYPE html>
   <p>Click any card to launch a script. Click again to stop it.</p>
 </header>
 <main id="cards"></main>
+
 <footer>
   <span class="dot" id="dot"></span>
   <span class="status" id="status">Nothing running.</span>
@@ -320,6 +332,12 @@ HTML = """<!DOCTYPE html>
     }
   }
 
+  async function getStatus() {
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    return j.running;
+  }
+
   async function toggle(tool) {
     const running = (await getStatus()).includes(tool.file);
     const ep = running ? '/api/stop' : '/api/launch';
@@ -330,12 +348,6 @@ HTML = """<!DOCTYPE html>
   async function stopAll() {
     await fetch('/api/stop_all', {method: 'POST'});
     refresh();
-  }
-
-  async function getStatus() {
-    const r = await fetch('/api/status');
-    const j = await r.json();
-    return j.running;
   }
 
   async function refresh() {
