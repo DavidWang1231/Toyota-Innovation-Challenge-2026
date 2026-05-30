@@ -39,6 +39,14 @@ TOOLS = [
         "color":   "red",
     },
     {
+        "section": "OPERATOR",
+        "name":    "Fatigue Monitor",
+        "file":    "fatigue_monitor.py",
+        "desc":    "Laptop webcam: detects drowsy operators via eye-closure "
+                   "and yawn tracking. Shows alerts when attention drops.",
+        "color":   "amber",
+    },
+    {
         "section": "CALIBRATION",
         "name":    "Camera Intrinsics",
         "file":    "calibrateCamera.py",
