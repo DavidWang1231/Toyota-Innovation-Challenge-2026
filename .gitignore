@@ -1,0 +1,9 @@
+Autonomous_Fleets/esp32_firmware/env.h
+Autonomous_Fleets/python_scripts/__pycache__/*
+Collaborative_Robotics/__pycache__/*
+Collaborative_Robotics/lib/__pycache__/*
+Fault_Prediction/MotorStallTestSetup/data/*
+Fault_Prediction/MotorStallTestSetup/!data/sample_data.csv
+Fault_Prediction/MotorStallTestSetup/plots/*
+Fault_Prediction/MotorStallTestSetup/!plots/sample_plot.png
+.vscode/sftp.json
