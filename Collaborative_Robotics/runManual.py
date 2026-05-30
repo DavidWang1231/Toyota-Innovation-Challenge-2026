@@ -6,6 +6,13 @@ import manualControl
 # Connect + home the arm
 api = dType.load()
 dobotArm.initialize_robot(api)
+
+# --- ADD THESE LINES TO MAXIMIZE SPEED ---
+# dType.SetPTPCommonParams(api, velocity, acceleration, isQueued)
+# Values range from 0 to 100 (percentage of max speed/accel)
+dType.SetPTPCommonParams(api, 100, 100, 1) 
+# -----------------------------------------
+
 print("Arm connected and homed.")
 
 # Open the camera (try built-in index 0, then external index 1)
