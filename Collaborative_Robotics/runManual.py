@@ -13,6 +13,7 @@ dobotArm.initialize_robot(api)
 dType.SetPTPCommonParams(api, 100, 100, 1) 
 # -----------------------------------------
 
+
 print("Arm connected and homed.")
 
 # Open the camera (try built-in index 0, then external index 1)
