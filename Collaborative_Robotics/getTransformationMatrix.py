@@ -5,6 +5,11 @@ import numpy as np
 import cv2
 import os
 
+# MUST match CAMERA_INDEX in pickCVBlock.py. 0 = laptop webcam, 1+ = USB.
+CAMERA_INDEX = 1
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Useful Global Variables
 CON_STR = {
     dType.DobotConnect.DobotConnect_NoError:  "DobotConnect_NoError",
@@ -12,14 +17,15 @@ CON_STR = {
     dType.DobotConnect.DobotConnect_Occupied: "DobotConnect_Occupied"
 }
 
-cam = cv2.VideoCapture(0)
+print(f"Opening camera at FORCED index {CAMERA_INDEX} (no fallback)...")
+cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
 
 if not cam.isOpened():
-    print("Camera failed to open")
+    print(f"Camera index {CAMERA_INDEX} failed to open. Try changing CAMERA_INDEX.")
     exit()
-    
-#if the program errors for file path problems, copy the relative path to camera_params.npz and paste it here and try again. 
-data = np.load("Collaborative_Robotics\camera_params.npz")
+print(f"Camera opened on index {CAMERA_INDEX}.")
+
+data = np.load(os.path.join(SCRIPT_DIR, "camera_params.npz"))
 camera_matrix = data["camera_matrix"]
 dist_coeffs   = data["dist_coeffs"]
 
@@ -187,7 +193,7 @@ def compute_homography(pixel_points):
     print("\nHomography Matrix\n")
     print(H)
 
-    np.save("HomographyMatrix.npy",H)
+    np.save(os.path.join(SCRIPT_DIR, "HomographyMatrix.npy"), H)
 
     print("Matrix saved")
 
