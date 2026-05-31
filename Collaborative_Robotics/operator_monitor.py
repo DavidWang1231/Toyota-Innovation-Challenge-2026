@@ -15,7 +15,7 @@ How to enroll a person:
   3) Run this script — enrollment happens automatically at startup.
 
 Run:    python3 operator_monitor.py
-Keys:   [T] tasks panel    [R] reset counters    [V] toggle voice    [Q] quit
+Keys:   [T] tasks panel    [R] reset counters    [Q] quit
 """
 
 import csv
@@ -53,8 +53,8 @@ MAR_YAWN           = 0.62    # was 0.55 — only count clearly open mouths
 YAWN_MIN_SEC       = 0.8     # was 0.6 — must hold the yawn longer
 YAWN_WINDOW_SEC    = 60.0
 YAWN_DROWSY_COUNT  = 5       # was 5 — need more yawns to trip drowsy
-VOICE_COOLDOWN_SEC = 6.0
 RECOVERY_ALERT_SEC = 5.0
+VOICE_COOLDOWN_SEC = 6.0       # don't repeat a voice alert faster than this
 SNOOZE_AFTER_CLICK_SEC = 20.0  # click anywhere to silence alerts for this long
 
 # ── Display size ──────────────────────────────────────────
@@ -425,203 +425,556 @@ class OperatorMonitor:
 
 
 # ───────────────────────────────────────────────────────────
-# Drawing — main view + collapsible tasks panel
+# Drawing helpers — rounded shapes, anti-aliased text
 # ───────────────────────────────────────────────────────────
+AA = cv2.LINE_AA          # anti-aliased line type for everything
+
+# UI animation + input state
+_ui_state = {
+    "task_progress": 0.0,
+    "last_t":        None,
+    "button_rects":  [],         # list of (rect, action_tuple) for hit-test
+    "panel_open":    False,
+    "editing_mode":  None,       # None | "add" | "edit"
+    "editing_idx":   -1,
+    "editing_text":  "",
+    "editing_for":   None,       # operator name being edited
+}
+# Open / close durations in seconds. Time-based so frame rate doesn't matter.
+TASKS_OPEN_SEC  = 0.22
+TASKS_CLOSE_SEC = 0.18
+
+def _ease_out(t):
+    """Cubic ease-out: starts fast, decelerates."""
+    return 1 - (1 - t) ** 3
+
 def _alpha_blend(frame, x, y, w, h, color, alpha):
     sub = frame[y:y+h, x:x+w]
     overlay = np.full_like(sub, color, dtype=np.uint8)
     cv2.addWeighted(overlay, alpha, sub, 1 - alpha, 0, sub)
 
+def _rounded_fill(frame, x1, y1, x2, y2, color, radius=10, alpha=1.0):
+    """Filled rounded rectangle with optional alpha blending.
+    Only the bounding rectangle is touched (avoids whole-frame copy)."""
+    if alpha >= 1.0:
+        cv2.rectangle(frame, (x1 + radius, y1), (x2 - radius, y2), color, -1, AA)
+        cv2.rectangle(frame, (x1, y1 + radius), (x2, y2 - radius), color, -1, AA)
+        for cx, cy in [(x1 + radius, y1 + radius), (x2 - radius, y1 + radius),
+                       (x1 + radius, y2 - radius), (x2 - radius, y2 - radius)]:
+            cv2.circle(frame, (cx, cy), radius, color, -1, AA)
+        return
+    # Sub-region alpha blend
+    H, W = frame.shape[:2]
+    sx1, sy1 = max(0, x1), max(0, y1)
+    sx2, sy2 = min(W, x2), min(H, y2)
+    if sx2 <= sx1 or sy2 <= sy1:
+        return
+    sub = frame[sy1:sy2, sx1:sx2]
+    overlay = sub.copy()
+    # shape coords in sub-region space
+    rx1, ry1, rx2, ry2 = x1 - sx1, y1 - sy1, x2 - sx1, y2 - sy1
+    cv2.rectangle(overlay, (rx1 + radius, ry1), (rx2 - radius, ry2), color, -1, AA)
+    cv2.rectangle(overlay, (rx1, ry1 + radius), (rx2, ry2 - radius), color, -1, AA)
+    for cx, cy in [(rx1 + radius, ry1 + radius), (rx2 - radius, ry1 + radius),
+                   (rx1 + radius, ry2 - radius), (rx2 - radius, ry2 - radius)]:
+        cv2.circle(overlay, (cx, cy), radius, color, -1, AA)
+    cv2.addWeighted(overlay, alpha, sub, 1 - alpha, 0, sub)
+
+def _rounded_outline(frame, x1, y1, x2, y2, color, radius=10, thickness=2):
+    cv2.line(frame, (x1 + radius, y1), (x2 - radius, y1), color, thickness, AA)
+    cv2.line(frame, (x1 + radius, y2), (x2 - radius, y2), color, thickness, AA)
+    cv2.line(frame, (x1, y1 + radius), (x1, y2 - radius), color, thickness, AA)
+    cv2.line(frame, (x2, y1 + radius), (x2, y2 - radius), color, thickness, AA)
+    cv2.ellipse(frame, (x1 + radius, y1 + radius), (radius, radius),
+                180, 0, 90, color, thickness, AA)
+    cv2.ellipse(frame, (x2 - radius, y1 + radius), (radius, radius),
+                270, 0, 90, color, thickness, AA)
+    cv2.ellipse(frame, (x1 + radius, y2 - radius), (radius, radius),
+                 90, 0, 90, color, thickness, AA)
+    cv2.ellipse(frame, (x2 - radius, y2 - radius), (radius, radius),
+                  0, 0, 90, color, thickness, AA)
+
+def save_operators_csv(db, csv_path):
+    """Write the in-memory operator tasks back to operators.csv."""
+    import io
+    # Preserve existing column order + any rows we didn't load (defensive)
+    fieldnames = ["name", "role", "tasks"]
+    existing = []
+    if csv_path.exists():
+        raw = csv_path.read_bytes().decode("utf-8", errors="replace").lstrip("﻿")
+        reader = csv.DictReader(io.StringIO(raw))
+        for row in reader:
+            existing.append(row)
+        if reader.fieldnames:
+            # Keep any extra columns the user added
+            for f in reader.fieldnames:
+                if f and f not in fieldnames:
+                    fieldnames.append(f)
+
+    seen = set()
+    rows_out = []
+    for row in existing:
+        name = (row.get("name") or "").strip()
+        if name in db.operators:
+            op = db.operators[name]
+            row["role"]  = op.get("role", row.get("role", ""))
+            row["tasks"] = ";".join(op.get("tasks", []))
+        rows_out.append(row)
+        seen.add(name)
+    # Any in-memory operators not in CSV → append them
+    for name, op in db.operators.items():
+        if name in seen:
+            continue
+        rows_out.append({
+            "name":  name,
+            "role":  op.get("role", ""),
+            "tasks": ";".join(op.get("tasks", [])),
+        })
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows_out:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _round_photo_corners(photo, radius=14):
+    """Returns the photo with rounded corners (areas outside the rounded
+    box are darkened so they blend cleanly when pasted onto a dark UI)."""
+    h, w = photo.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (radius, 0), (w - radius, h), 255, -1, AA)
+    cv2.rectangle(mask, (0, radius), (w, h - radius), 255, -1, AA)
+    for cx, cy in [(radius, radius), (w - radius, radius),
+                   (radius, h - radius), (w - radius, h - radius)]:
+        cv2.circle(mask, (cx, cy), radius, 255, -1, AA)
+    out = photo.copy()
+    out[mask == 0] = (18, 20, 24)        # corners match top-bar bg
+    return out
+
+def _metric_color(value, good_below, warn_below):
+    """Pick a green/amber/red based on thresholds.
+    Returns BGR tuple."""
+    if value < good_below:
+        return (110, 220, 130)           # green
+    if value < warn_below:
+        return (90, 200, 255)            # amber
+    return (90, 90, 245)                 # red
+
 
 def draw_main(frame, info, db, show_tasks):
     h, w = frame.shape[:2]
 
-    # ── Top status bar (smaller photo + smaller text) ─────
+    # ── Top status bar — slim, dark, with a soft bottom rule ──
     BAR_H = 140
-    _alpha_blend(frame, 0, 0, w, BAR_H, (18, 20, 24), 0.88)
-    cv2.line(frame, (0, BAR_H), (w, BAR_H), (60, 60, 70), 2)
+    _alpha_blend(frame, 0, 0, w, BAR_H, (15, 17, 22), 0.92)
+    # A subtle accent line in the operator's status colour
+    cv2.line(frame, (0, BAR_H), (w, BAR_H),
+             info["status_color"], 1, AA)
 
-    # ID photo — ~2/3 of previous (160 → 110)
+    # ── ID photo with rounded corners + soft border in status color ──
     PHOTO = 110
-    px, py = 14, (BAR_H - PHOTO) // 2
+    px, py = 18, (BAR_H - PHOTO) // 2
     op = db.operators.get(info["operator"]) if info["operator"] else None
     if op and op.get("thumb") is not None:
         thumb = cv2.resize(op["thumb"], (PHOTO, PHOTO))
-        frame[py:py+PHOTO, px:px+PHOTO] = thumb
+        rounded = _round_photo_corners(thumb, radius=14)
+        frame[py:py+PHOTO, px:px+PHOTO] = rounded
     else:
-        _alpha_blend(frame, px, py, PHOTO, PHOTO, (50, 50, 55), 1.0)
-        cv2.putText(frame, "?", (px + 38, py + 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (130, 130, 130), 4)
-    cv2.rectangle(frame, (px - 2, py - 2),
-                  (px + PHOTO + 2, py + PHOTO + 2),
-                  info["status_color"], 3)
+        _rounded_fill(frame, px, py, px + PHOTO, py + PHOTO,
+                      (50, 50, 55), radius=14)
+        cv2.putText(frame, "?", (px + 38, py + 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (130, 130, 130), 4, AA)
+    _rounded_outline(frame, px - 2, py - 2, px + PHOTO + 2, py + PHOTO + 2,
+                     info["status_color"], radius=16, thickness=2)
 
-    # Name + role + match (smaller text)
-    text_x = px + PHOTO + 18
+    # ── Name + role + match (cleaner type hierarchy) ────
+    text_x = px + PHOTO + 22
     name = info["operator"] or "Searching..."
     cv2.putText(frame, name, (text_x, py + 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.95, (240, 240, 240), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (245, 245, 248), 2, AA)
 
     role = ""
     if info["operator"]:
         role = db.operators.get(info["operator"], {}).get("role", "")
     if role:
-        cv2.putText(frame, role, (text_x, py + 66),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 175), 1)
+        cv2.putText(frame, role.upper(), (text_x, py + 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (140, 150, 165), 1, AA)
 
     if info["operator"]:
         confident = info.get("operator_confident", False)
-        label = f"match {info['operator_score']:.2f}"
-        if not confident:
-            label = f"closest · {label}"
-        cv2.putText(frame, label, (text_x, py + 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (120, 120, 125) if confident else (110, 140, 170), 1)
+        bar_w  = int(80 * min(1.0, max(0.0, info['operator_score'])))
+        # Small horizontal match-confidence bar
+        cv2.rectangle(frame, (text_x, py + 84), (text_x + 80, py + 88),
+                      (50, 55, 65), -1, AA)
+        cv2.rectangle(frame, (text_x, py + 84), (text_x + bar_w, py + 88),
+                      (120, 200, 130) if confident else (110, 140, 170),
+                      -1, AA)
+        label = "MATCH" if confident else "CLOSEST"
+        cv2.putText(frame, f"{label}  {info['operator_score']:.2f}",
+                    (text_x + 88, py + 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (120, 200, 130) if confident else (130, 160, 190), 1, AA)
 
-    # Status pill — only draw if tasks panel isn't covering it
+    # ── Rounded status pill (right side) ───────────────
     if not show_tasks:
-        PILL_W, PILL_H = 280, 74
-        pillx, pilly = w - PILL_W - 14, (BAR_H - PILL_H) // 2
-        _alpha_blend(frame, pillx, pilly, PILL_W, PILL_H,
-                     info["status_color"], 0.9)
-        cv2.rectangle(frame, (pillx, pilly), (pillx + PILL_W, pilly + PILL_H),
-                      (255, 255, 255), 2)
-        cv2.putText(frame, "STATUS", (pillx + 16, pilly + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, info["status"], (pillx + 16, pilly + 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        PILL_W, PILL_H = 240, 74
+        pillx, pilly = w - PILL_W - 18, (BAR_H - PILL_H) // 2
+        _rounded_fill(frame, pillx, pilly, pillx + PILL_W, pilly + PILL_H,
+                      info["status_color"], radius=14, alpha=0.92)
+        # Inner status indicator dot
+        dot_x, dot_y = pillx + 22, pilly + PILL_H // 2
+        cv2.circle(frame, (dot_x, dot_y), 6, (255, 255, 255), -1, AA)
+        cv2.circle(frame, (dot_x, dot_y), 6, (255, 255, 255), 2, AA)
+        cv2.putText(frame, "STATUS", (pillx + 40, pilly + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, AA)
+        cv2.putText(frame, info["status"], (pillx + 40, pilly + 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, AA)
 
-    # Fatigue metrics card (bottom-right) — 2/3 of previous size
+    # ── Fatigue metrics card (bottom-right) ─────────────
     if info["ear"] is not None and not show_tasks:
-        # (label, value) pairs — labels flush LEFT, values flush RIGHT
-        rows = [
-            ("Eyelid Height", f"{info['ear']:.2f}"),
-            ("%EyeClose",     f"{info['perclos']:.1f}"),
-            ("Yawns/s",       f"{info['yawns_recent']}/5"),
-        ]
-        row_h = 30
-        cw, ch = 260, row_h * len(rows) + 22
+        cw, ch = 270, 152
         cx, cy = w - cw - 16, h - ch - 16
-        _alpha_blend(frame, cx, cy, cw, ch, (15, 15, 15), 0.88)
-        cv2.rectangle(frame, (cx, cy), (cx + cw, cy + ch), (60, 60, 70), 1)
-        FONT, SCALE, THICK = cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1
+        _rounded_fill(frame, cx, cy, cx + cw, cy + ch,
+                      (16, 18, 24), radius=12, alpha=0.92)
+        _rounded_outline(frame, cx, cy, cx + cw, cy + ch,
+                         (55, 60, 72), radius=12, thickness=1)
+
+        FONT  = cv2.FONT_HERSHEY_SIMPLEX
+        SCALE = 0.55
+        THICK = 1
         left_edge  = cx + 16
         right_edge = cx + cw - 16
-        for i, (label, value) in enumerate(rows):
-            y = cy + 30 + i * row_h
-            cv2.putText(frame, label, (left_edge, y),
-                        FONT, SCALE, (170, 170, 175), THICK)
-            (vw, _), _ = cv2.getTextSize(value, FONT, SCALE, THICK)
-            cv2.putText(frame, value, (right_edge - vw, y),
-                        FONT, SCALE, (230, 230, 235), THICK)
 
-    # Flash alert (suppressed while snoozed)
+        # Color thresholds for live coloring
+        ear_color = (200, 220, 235) if info['ear'] is None else (
+            _metric_color(0.30 - info['ear'], 0.10, 0.17))    # invert: bigger EAR = better
+        # Actually treat low EAR as bad. Use closed-eye fraction:
+        ear_color = _metric_color(max(0.0, 0.30 - info['ear']), 0.10, 0.17)
+        perclos_color = _metric_color(info['perclos'], 16.0, 32.0)
+        yawn_color    = _metric_color(info['yawns_recent'], 3, 5)
+
+        rows = [
+            ("Eyelid Height", f"{info['ear']:.2f}",          ear_color),
+            ("% Eye Closed",  f"{info['perclos']:.1f}%",     perclos_color),
+            ("Yawns / min",   f"{info['yawns_recent']} / 5", yawn_color),
+        ]
+        row_y = cy + 30
+        for label, value, vcolor in rows:
+            cv2.putText(frame, label, (left_edge, row_y),
+                        FONT, SCALE, (150, 158, 172), THICK, AA)
+            (vw, _), _ = cv2.getTextSize(value, FONT, SCALE + 0.05, THICK + 1)
+            cv2.putText(frame, value, (right_edge - vw, row_y),
+                        FONT, SCALE + 0.05, vcolor, THICK + 1, AA)
+            row_y += 26
+
+        # PERCLOS progress bar at bottom of card
+        bar_y = cy + ch - 22
+        bar_x1, bar_x2 = left_edge, right_edge
+        cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 6),
+                      (40, 45, 55), -1, AA)
+        fill_w = int((bar_x2 - bar_x1) * min(1.0, info['perclos'] / 100.0))
+        if fill_w > 0:
+            cv2.rectangle(frame, (bar_x1, bar_y),
+                          (bar_x1 + fill_w, bar_y + 6),
+                          perclos_color, -1, AA)
+
+    # ── Flash alert (suppressed while snoozed) ─────────
     if not info.get("snoozed"):
         if info["microsleep"]:
             _flash(frame, "WAKE UP")
         elif info["status"] == "DROWSY":
             _flash(frame, "TAKE A BREAK")
     elif info["microsleep"] or info["status"] == "DROWSY":
-        # Tiny indicator that we're snoozed (so it's not invisible)
-        cv2.putText(frame, "(alerts snoozed - click to re-enable later)",
-                    (20, frame.shape[0] - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 160), 1)
+        _rounded_fill(frame, 16, h - 36, 360, h - 12,
+                      (35, 35, 42), radius=10, alpha=0.85)
+        cv2.putText(frame, "alerts snoozed — click to dismiss",
+                    (28, h - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (160, 165, 175), 1, AA)
 
-    # Tasks side panel
-    if show_tasks:
-        draw_tasks_panel(frame, info, db)
+    # ── Bottom-left hint strip (keyboard shortcuts) ────
+    _draw_key_hints(frame, show_tasks)
+
+    # ── Tasks side panel (time-based slide-in) ─────────
+    now_t = time.time()
+    if _ui_state["last_t"] is None:
+        _ui_state["last_t"] = now_t
+    dt = now_t - _ui_state["last_t"]
+    _ui_state["last_t"] = now_t
+    target = 1.0 if show_tasks else 0.0
+    cur = _ui_state["task_progress"]
+    duration = TASKS_OPEN_SEC if target > cur else TASKS_CLOSE_SEC
+    step = dt / max(0.001, duration)
+    if target > cur:
+        cur = min(target, cur + step)
     else:
-        _hint_button(frame, "[T] Tasks")
+        cur = max(target, cur - step)
+    _ui_state["task_progress"] = cur
+
+    if cur > 0.001:
+        draw_tasks_panel(frame, info, db, progress=cur)
+    if cur < 0.999:
+        _hint_button(frame, "[T] Tasks", fade=1.0 - cur)
+
+
+def _draw_key_hints(frame, show_tasks):
+    """Small unobtrusive keyboard shortcut row at the bottom-left."""
+    h, w = frame.shape[:2]
+    hints = [("T", "Hide" if show_tasks else "Tasks"),
+             ("R", "Reset"), ("Q", "Quit")]
+    x = 16
+    y = h - 28
+    for key, label in hints:
+        kw = 22
+        _rounded_fill(frame, x, y, x + kw, y + 20,
+                      (40, 44, 54), radius=4, alpha=0.85)
+        cv2.putText(frame, key, (x + 6, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 230), 1, AA)
+        cv2.putText(frame, label, (x + kw + 6, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 145, 158), 1, AA)
+        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        x += kw + 6 + lw + 18
 
 
 def _flash(frame, text):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1)
-    alpha = 0.16 + 0.08 * abs(np.sin(time.time() * 4))
+    alpha = 0.14 + 0.06 * abs(np.sin(time.time() * 4))
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.5, 6)
+    # Centered pill behind the text for legibility
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.3, 5)
+    pad_x, pad_y = 50, 26
+    px1 = (w - tw) // 2 - pad_x
+    px2 = px1 + tw + 2 * pad_x
+    py1 = (h - th) // 2 - pad_y
+    py2 = py1 + th + 2 * pad_y
+    _rounded_fill(frame, px1, py1, px2, py2, (0, 0, 0), radius=18, alpha=0.55)
+    _rounded_outline(frame, px1, py1, px2, py2, (255, 255, 255),
+                     radius=18, thickness=2)
     cv2.putText(frame, text, ((w - tw) // 2, (h + th) // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 6)
+                cv2.FONT_HERSHEY_SIMPLEX, 2.3, (255, 255, 255), 5, AA)
 
 
-def _hint_button(frame, label):
+def _hint_button(frame, label, fade=1.0):
+    """Floating Tasks button. `fade` (0..1) lets it disappear smoothly
+    as the side panel slides in."""
+    if fade <= 0.02:
+        return
     h, w = frame.shape[:2]
-    bw, bh = 160, 48
-    bx, by = w - bw - 14, 156          # just below the BAR_H=140 top bar
-    _alpha_blend(frame, bx, by, bw, bh, (45, 45, 55), 0.92)
-    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (200, 200, 210), 2)
-    cv2.putText(frame, label, (bx + 16, by + 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 245), 2)
+    bw, bh = 150, 42
+    # Slide off-screen to the right slightly as it fades
+    offset = int((1 - fade) * 30)
+    bx, by = w - bw - 16 + offset, 156
+    _rounded_fill(frame, bx, by, bx + bw, by + bh, (35, 38, 48),
+                  radius=12, alpha=0.92 * fade)
+    _rounded_outline(frame, bx, by, bx + bw, by + bh,
+                     (int(110 * fade), int(115 * fade), int(130 * fade)),
+                     radius=12, thickness=1)
+    color = (int(235 * fade), int(235 * fade), int(240 * fade))
+    cv2.putText(frame, label, (bx + 18, by + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, AA)
 
 
-def draw_tasks_panel(frame, info, db):
+def draw_tasks_panel(frame, info, db, progress=1.0):
+    """Slide-in glassy tasks panel. `progress` 0..1 controls how far in it is."""
     h, w = frame.shape[:2]
-    pw = 560                                  # tasks panel width
-    px, py = w - pw, 0
-    # Fully opaque — kills any bleed-through from the status pill underneath.
-    _alpha_blend(frame, px, py, pw, h, (12, 14, 18), 1.0)
-    cv2.line(frame, (px, 0), (px, h), (70, 70, 80), 2)
+    PW = 520                                          # final panel width
+    eased = _ease_out(max(0.0, min(1.0, progress)))
+    visible = int(PW * eased)                         # how much is on-screen
+    if visible <= 4:
+        return
+    # Reset button rect registry (filled while drawing this panel)
+    _ui_state["button_rects"] = []
+    fully_open = progress >= 0.999
+    panel_x = w - visible                             # left edge of panel
+    panel_y = 14
+    panel_h = h - 28
+    panel_x2 = w - 14
+    panel_y2 = panel_h + 14
 
-    # Header
-    cv2.putText(frame, "TASKS FOR TODAY", (px + 28, py + 58),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 230), 2)
-    cv2.line(frame, (px + 28, py + 78), (px + pw - 28, py + 78),
-             (80, 80, 95), 2)
+    # Panel content is rendered into a temp ROI so the rounded mask cleanly
+    # composites onto whatever's behind (camera feed, mesh, etc.).
+    # ── Layered glassy background ─────────────────────
+    # Dark base
+    _rounded_fill(frame, panel_x, panel_y, panel_x2, panel_y2,
+                  (14, 16, 22), radius=22, alpha=0.78 * eased)
+    # Subtle gradient overlay — lighter at top
+    _rounded_fill(frame, panel_x, panel_y, panel_x2, panel_y + 120,
+                  (28, 32, 42), radius=22, alpha=0.35 * eased)
+    # Thin highlight along the top + left edges
+    _rounded_outline(frame, panel_x, panel_y, panel_x2, panel_y2,
+                     (90, 100, 120), radius=22, thickness=1)
+
+    # All inner content positions are in-panel coordinates
+    cx = panel_x + 32
+    inner_w = visible - 64
+
+    # ── Header — uppercase kicker + thin accent dot ───
+    cv2.putText(frame, "TASKS FOR TODAY", (cx, panel_y + 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 188, 205), 1, AA)
+    # Small status dot next to the header
+    cv2.circle(frame, (cx + 220, panel_y + 46), 4, (90, 200, 130), -1, AA)
+    # Hairline divider
+    cv2.line(frame, (cx, panel_y + 78), (panel_x2 - 32, panel_y + 78),
+             (45, 50, 62), 1, AA)
 
     op_name = info["operator"]
     if not op_name or op_name not in db.operators:
         cv2.putText(frame, "No operator identified",
-                    (px + 28, py + 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2)
-        cv2.putText(frame, "(no tasks to show)",
-                    (px + 28, py + 196),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (130, 130, 130), 2)
-        cv2.putText(frame, "[T] hide panel",
-                    (px + 28, h - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (160, 160, 160), 2)
+                    (cx, panel_y + 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 185, 195), 1, AA)
+        cv2.putText(frame, "Once a face is matched, their tasks will appear here.",
+                    (cx, panel_y + 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 125, 135), 1, AA)
+        _draw_panel_footer(frame, cx, panel_x2, panel_y2)
         return
 
     op = db.operators[op_name]
-    # Operator name
-    cv2.putText(frame, op_name, (px + 28, py + 140),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (245, 245, 245), 3)
-    if op["role"]:
-        cv2.putText(frame, op["role"], (px + 28, py + 184),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (170, 170, 180), 2)
 
-    # Tasks list
-    y = py + 260
+    # ── Operator name + role ──────────────────────────
+    cv2.putText(frame, op_name, (cx, panel_y + 128),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.15, (245, 246, 250), 2, AA)
+    if op["role"]:
+        cv2.putText(frame, op["role"].upper(), (cx, panel_y + 156),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (130, 140, 158), 1, AA)
+
+    # Task count chip
     tasks = op["tasks"]
+    chip_text = f"{len(tasks)} ASSIGNED"
+    (cw, _), _ = cv2.getTextSize(chip_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    chip_x1 = panel_x2 - 32 - cw - 18
+    chip_y1 = panel_y + 110
+    _rounded_fill(frame, chip_x1, chip_y1, chip_x1 + cw + 18, chip_y1 + 24,
+                  (50, 55, 70), radius=10, alpha=0.8)
+    cv2.putText(frame, chip_text, (chip_x1 + 9, chip_y1 + 17),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 190, 210), 1, AA)
+
+    # ── Hairline divider before tasks ────────────────
+    cv2.line(frame, (cx, panel_y + 188), (panel_x2 - 32, panel_y + 188),
+             (35, 40, 52), 1, AA)
+
+    # ── "+ Add Task" pill button ──────────────────────
+    ab_x1, ab_y1 = cx, panel_y + 200
+    ab_x2, ab_y2 = cx + 138, ab_y1 + 30
+    _rounded_fill(frame, ab_x1, ab_y1, ab_x2, ab_y2,
+                  (40, 60, 90), radius=10, alpha=0.95)
+    _rounded_outline(frame, ab_x1, ab_y1, ab_x2, ab_y2,
+                     (110, 165, 230), radius=10, thickness=1)
+    cv2.putText(frame, "+  ADD TASK", (ab_x1 + 14, ab_y1 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (175, 210, 245), 1, AA)
+    if fully_open:
+        _ui_state["button_rects"].append(
+            ((ab_x1, ab_y1, ab_x2, ab_y2), ("add",)))
+
+    # ── Tasks list ────────────────────────────────────
+    y = panel_y + 264
     if not tasks:
-        cv2.putText(frame, "(no tasks listed in operators.csv)",
-                    (px + 28, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (140, 140, 140), 2)
+        cv2.putText(frame, "No tasks yet — press + ADD TASK above.",
+                    (cx, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 145, 155), 1, AA)
     else:
         for i, t in enumerate(tasks, start=1):
-            y = _draw_task_line(frame, t, i, px + 28, y, pw - 56)
-            y += 64         # generous vertical spacing between tasks
+            y = _draw_task_line(frame, t, i, cx, y, inner_w - 16,
+                                fully_open=fully_open,
+                                panel_right=panel_x2 - 32)
+            y += 28
 
-    cv2.putText(frame, "[T] hide panel",
-                (px + 28, h - 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (170, 170, 175), 2)
+    _draw_panel_footer(frame, cx, panel_x2, panel_y2)
 
 
-def _draw_task_line(frame, text, idx, x, y, max_w):
-    """Returns the y-coordinate of the last drawn line."""
-    # Bigger number circle
-    cv2.circle(frame, (x + 20, y - 14), 20, (0, 165, 255), 3)
-    num_x = x + 12 if idx < 10 else x + 6
-    cv2.putText(frame, str(idx), (num_x, y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 165, 255), 2)
+def draw_text_input_modal(frame):
+    """In-window text input overlay shown while editing/adding a task."""
+    if not _ui_state.get("editing_mode"):
+        return
+    h, w = frame.shape[:2]
+    # Dim the whole frame
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-    # Word wrap to as many lines as needed
+    # Centered card
+    bw, bh = min(820, w - 80), 220
+    bx = (w - bw) // 2
+    by = (h - bh) // 2
+    _rounded_fill(frame, bx, by, bx + bw, by + bh, (22, 26, 36),
+                  radius=18, alpha=1.0)
+    _rounded_outline(frame, bx, by, bx + bw, by + bh,
+                     (110, 165, 230), radius=18, thickness=2)
+
+    # Header
+    mode = _ui_state["editing_mode"]
+    title = "ADD NEW TASK" if mode == "add" else "EDIT TASK"
+    cv2.putText(frame, title, (bx + 30, by + 44),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 195, 215), 1, AA)
+    for_name = _ui_state.get("editing_for") or ""
+    if for_name:
+        cv2.putText(frame, f"for {for_name}",
+                    (bx + 30, by + 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (130, 140, 155), 1, AA)
+
+    # Hairline divider
+    cv2.line(frame, (bx + 30, by + 84), (bx + bw - 30, by + 84),
+             (50, 56, 70), 1, AA)
+
+    # Input field — rounded inset with the current buffer + blinking caret
+    fx1, fy1 = bx + 30, by + 104
+    fx2, fy2 = bx + bw - 30, by + 154
+    _rounded_fill(frame, fx1, fy1, fx2, fy2, (12, 14, 20),
+                  radius=10, alpha=1.0)
+    _rounded_outline(frame, fx1, fy1, fx2, fy2, (60, 75, 100),
+                     radius=10, thickness=1)
+    text = _ui_state.get("editing_text", "")
+    # Blinking caret
+    caret = "|" if int(time.time() * 2) % 2 == 0 else " "
+    cv2.putText(frame, text + caret, (fx1 + 14, fy2 - 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 235, 245), 1, AA)
+
+    # Hints
+    cv2.putText(frame, "ENTER  save",
+                (bx + 30, by + bh - 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (160, 170, 190), 1, AA)
+    cv2.putText(frame, "ESC  cancel",
+                (bx + 160, by + bh - 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (160, 170, 190), 1, AA)
+
+
+def _draw_panel_footer(frame, cx, panel_x2, panel_y2):
+    """Bottom-of-panel rounded chip with the hide hint."""
+    fy1 = panel_y2 - 42
+    fy2 = panel_y2 - 14
+    fw  = 110
+    _rounded_fill(frame, cx, fy1, cx + fw, fy2, (28, 32, 42),
+                  radius=10, alpha=0.85)
+    _rounded_outline(frame, cx, fy1, cx + fw, fy2, (55, 62, 78),
+                     radius=10, thickness=1)
+    cv2.putText(frame, "T  hide", (cx + 14, fy2 - 9),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 190, 205), 1, AA)
+
+
+def _draw_task_line(frame, text, idx, x, y, max_w,
+                    fully_open=True, panel_right=None):
+    """Smooth task row: tiny accent dot + clean text + edit/delete chips
+    at the right edge."""
+    # Tiny rounded accent square (acts like a bullet)
+    dot_size = 18
+    cy = y - dot_size + 2
+    _rounded_fill(frame, x, cy, x + dot_size, cy + dot_size,
+                  (35, 40, 54), radius=5)
+    # Place the small index number centered inside the dot
+    idx_str = f"{idx:02d}"
+    (iw, ih), _ = cv2.getTextSize(idx_str, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+    cv2.putText(frame, idx_str,
+                (x + (dot_size - iw) // 2, cy + (dot_size + ih) // 2 - 1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 180, 235), 1, AA)
+
+    # Word wrap, lighter weight than before
     words = text.split()
     lines, cur = [], ""
     for word in words:
         candidate = (cur + " " + word).strip()
-        (tw, _), _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, 0.95, 2)
-        if tw < max_w - 60:
+        (tw, _), _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, 0.72, 1)
+        if tw < max_w - 40:
             cur = candidate
         else:
             if cur:
@@ -630,13 +983,50 @@ def _draw_task_line(frame, text, idx, x, y, max_w):
     if cur:
         lines.append(cur)
 
-    text_x = x + 54
-    LINE_GAP = 36
+    text_x = x + dot_size + 14
+    LINE_GAP = 26
     for i, line in enumerate(lines):
         ly = y + i * LINE_GAP
         cv2.putText(frame, line, (text_x, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (230, 230, 235), 2)
-    return y + max(0, (len(lines) - 1)) * LINE_GAP
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (228, 232, 240), 1, AA)
+    # Faint divider below the task — gives the list its rhythm
+    last_y = y + max(0, (len(lines) - 1)) * LINE_GAP
+    cv2.line(frame,
+             (text_x, last_y + 14),
+             (text_x + min(int(max_w * 0.75), 320), last_y + 14),
+             (32, 36, 48), 1, AA)
+
+    # ── Edit + Delete chips at the right edge of the row ──
+    if panel_right is not None and fully_open:
+        chip_w, chip_h = 28, 22
+        gap = 6
+        del_x2 = panel_right
+        del_x1 = del_x2 - chip_w
+        edt_x2 = del_x1 - gap
+        edt_x1 = edt_x2 - chip_w
+        chip_y1 = y - 14
+        chip_y2 = chip_y1 + chip_h
+        # Edit chip
+        _rounded_fill(frame, edt_x1, chip_y1, edt_x2, chip_y2,
+                      (40, 50, 64), radius=6, alpha=0.95)
+        _rounded_outline(frame, edt_x1, chip_y1, edt_x2, chip_y2,
+                         (110, 165, 230), radius=6, thickness=1)
+        cv2.putText(frame, "E", (edt_x1 + 9, chip_y2 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (175, 210, 245), 1, AA)
+        # Delete chip
+        _rounded_fill(frame, del_x1, chip_y1, del_x2, chip_y2,
+                      (60, 36, 40), radius=6, alpha=0.95)
+        _rounded_outline(frame, del_x1, chip_y1, del_x2, chip_y2,
+                         (230, 110, 110), radius=6, thickness=1)
+        cv2.putText(frame, "X", (del_x1 + 9, chip_y2 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (245, 175, 175), 1, AA)
+
+        _ui_state["button_rects"].append(
+            ((edt_x1, chip_y1, edt_x2, chip_y2), ("edit", idx - 1)))
+        _ui_state["button_rects"].append(
+            ((del_x1, chip_y1, del_x2, chip_y2), ("delete", idx - 1)))
+
+    return last_y
 
 
 # ───────────────────────────────────────────────────────────
@@ -679,21 +1069,90 @@ def main(camera_index=0):
     WINDOW_NAME = "Operator Monitor"
     cv2.namedWindow(WINDOW_NAME)
 
+    def _begin_add():
+        name = monitor.committed_name
+        if not name or name not in db.operators:
+            print("[add] No operator identified.")
+            return
+        _ui_state["editing_mode"] = "add"
+        _ui_state["editing_idx"]  = -1
+        _ui_state["editing_text"] = ""
+        _ui_state["editing_for"]  = name
+
+    def _begin_edit(idx):
+        name = monitor.committed_name
+        if not name or name not in db.operators:
+            return
+        tasks = db.operators[name]["tasks"]
+        if not (0 <= idx < len(tasks)):
+            return
+        _ui_state["editing_mode"] = "edit"
+        _ui_state["editing_idx"]  = idx
+        _ui_state["editing_text"] = tasks[idx]
+        _ui_state["editing_for"]  = name
+
+    def _do_delete(idx):
+        name = monitor.committed_name
+        if not name or name not in db.operators:
+            return
+        tasks = db.operators[name]["tasks"]
+        if 0 <= idx < len(tasks):
+            removed = tasks.pop(idx)
+            save_operators_csv(db, OPERATORS_CSV)
+            print(f"[del] Removed: {removed}")
+
+    def _commit_edit():
+        mode = _ui_state.get("editing_mode")
+        name = _ui_state.get("editing_for")
+        text = _ui_state.get("editing_text", "").strip()
+        if name and text and name in db.operators:
+            tasks = db.operators[name]["tasks"]
+            if mode == "add":
+                tasks.append(text)
+                print(f"[add] Added: {text}")
+            elif mode == "edit":
+                idx = _ui_state.get("editing_idx", -1)
+                if 0 <= idx < len(tasks):
+                    tasks[idx] = text
+                    print(f"[edit] Updated task {idx+1}: {text}")
+            save_operators_csv(db, OPERATORS_CSV)
+        _cancel_edit()
+
+    def _cancel_edit():
+        _ui_state["editing_mode"] = None
+        _ui_state["editing_text"] = ""
+        _ui_state["editing_idx"]  = -1
+        _ui_state["editing_for"]  = None
+
     def _on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            monitor.snooze()
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        # If editing, swallow clicks (text-input is keyboard only)
+        if _ui_state.get("editing_mode"):
+            return
+        # Hit-test panel buttons first
+        for rect, action in _ui_state.get("button_rects", []):
+            x1, y1, x2, y2 = rect
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                kind = action[0]
+                if kind == "add":
+                    _begin_add()
+                elif kind == "edit":
+                    _begin_edit(action[1])
+                elif kind == "delete":
+                    _do_delete(action[1])
+                return
+        # Fallback: snooze fatigue alerts
+        monitor.snooze()
     cv2.setMouseCallback(WINDOW_NAME, _on_mouse)
     show_tasks = False
 
-    print("Running. Keys:  T tasks panel | R reset | V toggle voice | Q quit")
+    print("Running. Keys:  T tasks | R reset | Q quit  (use + / E / X buttons in the panel)")
     while True:
         ok, frame = cap.read()
         if not ok:
             continue
-        # Real orientation — no mirroring.
-        # Run analysis on the ORIGINAL frame (faster).
         info = monitor.process(frame)
-        # Upscale to display size so overlays look big and readable.
         if frame.shape[1] != DISPLAY_WIDTH:
             new_h = int(frame.shape[0] * DISPLAY_WIDTH / frame.shape[1])
             display = cv2.resize(frame, (DISPLAY_WIDTH, new_h),
@@ -701,9 +1160,24 @@ def main(camera_index=0):
         else:
             display = frame
         draw_main(display, info, db, show_tasks)
+        # Text input modal renders over everything when active
+        draw_text_input_modal(display)
 
         cv2.imshow(WINDOW_NAME, display)
         key = cv2.waitKey(1) & 0xFF
+
+        # ── Edit mode captures all keys (so Q etc. don't quit) ──
+        if _ui_state.get("editing_mode"):
+            if key == 27:                # ESC — cancel
+                _cancel_edit()
+            elif key in (13, 10):        # ENTER — commit
+                _commit_edit()
+            elif key in (8, 127):        # BACKSPACE
+                _ui_state["editing_text"] = _ui_state["editing_text"][:-1]
+            elif 32 <= key <= 126:       # printable ASCII
+                _ui_state["editing_text"] += chr(key)
+            continue                     # skip normal key handling
+
         if key == ord('q'):
             break
         elif key == ord('t'):
@@ -711,9 +1185,6 @@ def main(camera_index=0):
         elif key == ord('r'):
             monitor.reset_counters()
             print("Counters reset.")
-        elif key == ord('v'):
-            monitor.voice_enabled = not monitor.voice_enabled
-            print(f"Voice: {'ON' if monitor.voice_enabled else 'OFF'}")
 
     cap.release()
     cv2.destroyAllWindows()
