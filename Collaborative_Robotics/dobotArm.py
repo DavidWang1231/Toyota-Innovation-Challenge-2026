@@ -29,8 +29,7 @@ def initialize_robot(api):
         exit()
     
     #we've found it, so let's try to connect
-    state = dType.ConnectDobot(api, "COM7", 115200)[0]
-    
+    state = dType.ConnectDobot(api, "COM6", 115200)[0]    
     #If the connection failed at this point, we also can't proceed, so we need to exit
     if state != dType.DobotConnect.DobotConnect_NoError:
         print("Failed to connect to Dobot!")
@@ -47,8 +46,13 @@ def initialize_robot(api):
     dType.SetQueuedCmdStopExec(api)
     dType.SetQueuedCmdClear(api)
     
-    #Set the robot's max speed and acceleration. We're keeping these to 50% of max for safety
-    dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
+    #Set the robot's max speed and acceleration.
+    #100% velocity / 80% acceleration = fast moves with minimal overshoot.
+    #Precision is encoder-driven, so speed doesn't reduce final-position accuracy.
+    dType.SetPTPCommonParams(api, 100, 80, isQueued=1)
+    #PTPCoordinateParams sets per-axis Cartesian speed (mm/s) and accel for XYZ moves.
+    #200 mm/s is the Magician's practical max for clean motion.
+    dType.SetPTPCoordinateParams(api, 200, 200, 200, 200, isQueued=1)
     
     """
         Home the robot. 
