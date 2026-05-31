@@ -257,12 +257,19 @@ if __name__ == "__main__":
     # ── Open Camera ───────────────────────────────────────────
     # Try indices 0 and 1 so it works whether the laptop's built-in webcam
     # or an external camera (e.g. Orbbec) is the default.
+   # Prefer the USB-connected camera. Try external indices (1, 2, 3) first,
+    # then fall back to the laptop's built-in webcam (index 0) only if no
+    # USB camera is plugged in. To FORCE only the USB camera (no fallback),
+    # remove the trailing 0 from this tuple.
+    CAMERA_INDICES_TO_TRY = (1, 2, 3, 0)
+
     cap = None
-    for idx in (0, 1):
+    for idx in CAMERA_INDICES_TO_TRY:
         test = cv2.VideoCapture(idx)
         if test.isOpened():
             cap = test
-            print(f"Camera opened at index {idx}.")
+            which = "built-in webcam" if idx == 0 else "external (USB) camera"
+            print(f"Camera opened at index {idx} ({which}).")
             break
         test.release()
     
