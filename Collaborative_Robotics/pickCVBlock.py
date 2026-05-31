@@ -416,7 +416,10 @@ def phase_detect_tray():
 # PHASE 2: DETECT TARGETS
 # ─────────────────────────────────────────
 def phase_detect_targets():
-    print("\n[PHASE 2] Scanning for targets...")
+    """PHASE 2 — find the red blocks. Hand detection is OFF here on purpose:
+    we just want a clean view of the scene so blocks lock in faster, and no
+    MediaPipe inference is wasted while the arm is still idle."""
+    print("\n[PHASE 2] Scanning for targets... (hand detection OFF)")
     stability_counter = 0
     last_count = 0
     while True:
@@ -428,15 +431,6 @@ def phase_detect_targets():
 
         current_list = find_red_objects(frame, draw_on=display_frame)
 
-        # Passive hand-detection overlay so the user can SEE that hand
-        # tracking is alive even before the arm starts. This does not pause
-        # scanning — safety reactions only kick in once the arm is moving
-        # (inside phase_execute_batch's monitor_humans calls).
-        hand_zone, _, _, display_frame = hd.detect_zone_and_gesture(
-            display_frame, DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE, draw=True)
-        cv2.putText(display_frame, f"HANDS: {hand_zone}", (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
         if len(current_list) > 0 and len(current_list) == last_count:
             stability_counter += 1
         else:
@@ -444,14 +438,46 @@ def phase_detect_targets():
             last_count = len(current_list)
 
         progress = int((stability_counter/STABILITY_LIMIT)*100)
-        cv2.putText(display_frame, f"LOCKING TARGETS: {progress}%  ({len(current_list)} found)", (20,40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        cv2.putText(display_frame,
+                    f"LOCKING TARGETS: {progress}%  ({len(current_list)} found)",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, "HAND DETECTION: OFF",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
         cv2.imshow("Detection", display_frame)
         cv2.waitKey(1)
 
         if stability_counter >= STABILITY_LIMIT:
             print(f"Locked {len(current_list)} targets.")
             return current_list
+
+
+def phase_arm_hand_detection():
+    """Between target-lock and robot motion: spin up MediaPipe, wait until
+    we get at least one clean frame of hand tracking running (so the user
+    SEES it come online), then return. After this, hand detection stays
+    active through every monitor_humans() call inside phase_execute_batch."""
+    print("\n[PHASE 2.5] Arming hand detection...")
+    # Warm-up loop: render a few frames so the operator sees "HAND DETECTION:
+    # ON" come up, and MediaPipe loads its model before the arm starts moving.
+    WARMUP_FRAMES = 30
+    for i in range(WARMUP_FRAMES):
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        display_frame = frame.copy()
+        draw_zones(display_frame)
+        zone, _, _, display_frame = hd.detect_zone_and_gesture(
+            display_frame, DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE, draw=True)
+        cv2.putText(display_frame,
+                    f"ARMING HAND DETECTION  ({i+1}/{WARMUP_FRAMES})",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        cv2.putText(display_frame,
+                    f"hands: {zone}",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.imshow("Detection", display_frame)
+        cv2.waitKey(1)
+    print("[PHASE 2.5] Hand detection is now ACTIVE.")
 
 def phase_detect_targets_quick(frame):
     return find_red_objects(frame)
@@ -536,6 +562,9 @@ drop_zone = phase_detect_tray()
 while machine_state == "scanning target":
     pick_target = phase_detect_targets()
     if pick_target is not None:
+        # Now that we have the blocks locked, turn hand detection ON
+        # before the arm starts moving.
+        phase_arm_hand_detection()
         next_state()
 
 while machine_state == "pick place":
