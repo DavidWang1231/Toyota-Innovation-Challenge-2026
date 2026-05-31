@@ -5,13 +5,16 @@ import numpy as np
 import cv2
 import time
 import hand_detection as hd
-import manualControl
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 """CONSTANTS"""
 Z_SAFE = 40
-Z_PICK = -25
+# Z_PICK = gripper height when grabbing a block off the table.
+# More negative = closer to the table. The Dobot Magician can safely reach
+# about -70 at typical XY range. If the gripper still hovers, drop this in
+# 5mm steps. If it slams the table, raise it.
+Z_PICK = -55
 STABILITY_LIMIT = 60
 
 # Robot speed: full when clear, slow when a hand is in the WARNING zone.
@@ -30,28 +33,35 @@ WAVE_DIR_SIGN = 1
 # 0 = laptop built-in. 1, 2, 3 = external/USB. Run hand_detection.py to find it.
 CAMERA_INDEX = 1
 
-# ---- Red object detection (tuned for distance) ----
-RED_HSV_LOWER_1 = (0,   70, 40)
-RED_HSV_UPPER_1 = (10, 255, 255)
-RED_HSV_LOWER_2 = (170, 70, 40)
+# ---- Red object detection ----
+# Tuned for the actual targets (see assets/IMG_6708.jpeg): LARGE red foam
+# pieces (strips + stacked gear-shapes) on a warm wood table.
+#
+# Two complementary tests are AND'd together:
+#   1. HSV hue ring (red wraps around H=0 and H=180)
+#   2. LAB a* channel > LAB_A_MIN  (a* is OpenCV's red-vs-green axis,
+#      0-255 with 128 = neutral. Wood sits at ~135-145, real red foam at
+#      170+. This is the single most effective wood-rejector.)
+RED_HSV_LOWER_1 = (0,   70,  50)
+RED_HSV_UPPER_1 = (12,  255, 255)
+RED_HSV_LOWER_2 = (168, 70,  50)
 RED_HSV_UPPER_2 = (180, 255, 255)
-TARGET_MIN_AREA = 20         # ~5x5 px - small/distant objects still counted
-TARGET_MAX_AREA = 20000      # rejects huge reds (clothing, big background items)
-
-# ---- Orientation-aware grip (rotate gripper to match the part's angle) ----
-USE_ORIENTATION = True   # set False to disable rotation and grab straight-on
-ORIENT_SIGN     = 1      # if the gripper rotates the WRONG way, change to -1
-ORIENT_OFFSET   = 0      # degrees added after sign; tune on hardware if needed
-ORIENT_MAX      = 85     # clamp rHead so we never command an impossible angle
-
-def gripper_angle(part_angle):
-    """Convert a detected part angle (deg) into a safe gripper rHead value."""
-    if not USE_ORIENTATION:
-        return 0
-    a = ORIENT_SIGN * part_angle + ORIENT_OFFSET
-    # normalize to (-90, 90] then clamp
-    a = (a + 90) % 180 - 90
-    return max(-ORIENT_MAX, min(ORIENT_MAX, a))
+# LAB a-channel floor — the workhorse for rejecting wood. Raise toward 170
+# if wood gets through. Drop toward 140 if dim red objects get missed.
+# 145 catches small/dim reds while still rejecting wood (wood a* ≈ 130-140).
+LAB_A_MIN = 145
+# Min area: covers a range from ~17x17 small cube up to large foam gears.
+# Bump UP if you see false hits, DOWN if small reds are missed.
+TARGET_MIN_AREA = 300
+TARGET_MAX_AREA = 80000      # cap rejects giant background reds (clothing, walls)
+# After two centroids land within this many ROBOT MILLIMETRES of each other,
+# treat them as the same piece (keeps the bigger one).
+DEDUPE_DIST_MM = 30
+# Cap on targets per run.
+MAX_TARGETS = 6
+# Show "Red Mask (debug)" + "LAB a (debug)" windows so you can SEE what each
+# gate is passing. Invaluable for tuning. Set False to hide.
+RED_DEBUG_MASK = True
 
 # ---- Tray detection (drop target) ----
 # Tray = the most circular bright blob inside the CAUTION zone. If none is
@@ -66,8 +76,11 @@ TRAY_DEBUG_MASK        = True      # show "Tray Mask (debug)" window while searc
 DROP_FALLBACK_ROBOT_XY = (250, 0)  # used if tray not found
 
 # ── Zones (scaled for 640x480 camera) ──
-# Adjust these rectangles to match where your robot actually sits in the
-# camera view. Coordinates are (x1, y1, x2, y2) in pixels.
+# Defaults — these are the STARTING positions. After target detection,
+# phase_setup_zones() lets the user redraw or drag any zone with the same
+# keys hand_detection.py uses (D / C / H / M). The redrawn values overwrite
+# these module-level globals at runtime.
+# Coordinates are (x1, y1, x2, y2) in pixels.
 HANDOFF_ZONE = (450, 280, 640, 480)   # bottom-right, worker reaches here
 CAUTION_ZONE = (40,  80, 600, 470)    # whole workspace; outside = ignored
 DANGER_ZONE  = (80, 150, 340, 460)    # tight box around the Dobot body
@@ -234,20 +247,57 @@ def _work_area_mask(shape):
 
 def find_red_objects(frame, draw_on=None):
     """
-    Find red blobs inside (CAUTION zone MINUS DANGER zone).
-    Looser HSV + OPEN+CLOSE morphology = works at distance.
+    Find red objects in the frame (the foam strips/gear-stacks).
+
+    Pipeline (tuned for IMG_6708 — red foam on wood):
+      1. Light blur to suppress sensor noise.
+      2. HSV gate: hue in the two red bands AND S,V above floors.
+      3. LAB gate: a* channel > LAB_A_MIN. This is the WOOD-REJECTOR —
+         wood's a* sits well below 160, real red foam pushes past 170.
+      4. AND both gates together (a pixel must satisfy BOTH to count).
+      5. OPEN 3x3 to kill specks.
+      6. CLOSE 15x15 to fill the gear-stack's internal cutouts so one
+         object stays one contour.
+      7. Dilate 5x5 to merge adjacent stacked pieces that touch.
+      8. Drop tiny/huge contours, dedupe by robot-frame distance, keep
+         only the MAX_TARGETS biggest.
+
     Returns list of (robot_x, robot_y).
     """
-    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+
+    # ── HSV gate (red wraps around H=0 and H=180) ──────────────────────
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array(RED_HSV_LOWER_1), np.array(RED_HSV_UPPER_1)) + \
-           cv2.inRange(hsv, np.array(RED_HSV_LOWER_2), np.array(RED_HSV_UPPER_2))
+    hsv_mask = (cv2.inRange(hsv, np.array(RED_HSV_LOWER_1),
+                                  np.array(RED_HSV_UPPER_1))
+                + cv2.inRange(hsv, np.array(RED_HSV_LOWER_2),
+                                    np.array(RED_HSV_UPPER_2)))
+
+    # ── LAB a* gate (red-vs-green axis) — the wood rejector ────────────
+    lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+    _, a_chan, _ = cv2.split(lab)
+    lab_mask = cv2.inRange(a_chan, LAB_A_MIN, 255)
+
+    # ── Combine: a pixel must be red in BOTH color spaces ──────────────
+    mask = cv2.bitwise_and(hsv_mask, lab_mask)
+
+    # OPEN first to delete salt-and-pepper specks. Use a 3x3 to preserve
+    # small targets (a 30x30 px cube barely survives anything bigger).
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    mask = cv2.bitwise_and(mask, _work_area_mask(frame.shape))
+    # CLOSE 9x9 — bridges small gaps without erasing small objects. Good
+    # compromise between "fill foam gear cutouts" and "keep a small cube".
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    if RED_DEBUG_MASK:
+        cv2.imshow("Red Mask (debug)", mask)
+        cv2.imshow("LAB a (debug)", a_chan)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    result = []
+
+    # First pass: collect (area, centroid_px, centroid_robot, contour) for
+    # every contour that passes the size gate.
+    candidates = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < TARGET_MIN_AREA or area > TARGET_MAX_AREA:
@@ -258,114 +308,143 @@ def find_red_objects(frame, draw_on=None):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
         rx, ry = pixel_to_robot(cx, cy, H_matrix)
-        # --- object orientation: angle of the part's long axis ---
-        (_c, (w_box, h_box), ang) = cv2.minAreaRect(cnt)
-        if w_box < h_box:        # make the angle describe the LONG side
-            ang += 90
-        result.append((rx, ry, ang))
+        candidates.append({"area": area, "px": (cx, cy),
+                           "robot": (rx, ry), "cnt": cnt})
+
+    # Sort by area DESC — bigger blobs win when we dedupe near-duplicates.
+    candidates.sort(key=lambda c: c["area"], reverse=True)
+
+    kept = []
+    for c in candidates:
+        rx, ry = c["robot"]
+        is_dup = False
+        for k in kept:
+            kx, ky = k["robot"]
+            if (rx - kx) ** 2 + (ry - ky) ** 2 < DEDUPE_DIST_MM ** 2:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(c)
+        if len(kept) >= MAX_TARGETS:
+            break
+
+    result = []
+    for c in kept:
+        cx, cy = c["px"]
+        rx, ry = c["robot"]
+        result.append((rx, ry))
         if draw_on is not None:
-            box = cv2.boxPoints(((cx, cy), (w_box, h_box), ang))
-            cv2.drawContours(draw_on, [box.astype(np.int32)], -1, (0, 255, 0), 2)
+            cv2.drawContours(draw_on, [c["cnt"]], -1, (0, 255, 0), 2)
             cv2.circle(draw_on, (cx, cy), 5, (0, 0, 255), -1)
-            cv2.putText(draw_on, f"RED {int(ang)}deg", (cx + 8, cy - 8),
+            cv2.putText(draw_on, f"RED({int(c['area'])})",
+                        (cx + 8, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     return result
 
 # ─────────────────────────────────────────
-# TRAY DETECTION (drop target)
+# TRAY SELECTION (drop target) — MANUAL ONLY
+# Auto-detection was unreliable on silver trays with washed-out cameras
+# (tried Hough circles, then brightness+circularity contour). We now ask
+# the user to click-and-drag a circle around the tray on the Detection
+# window before the pick loop starts. Only the circle CENTER is used —
+# it's converted via homography to a robot (x, y). The radius is purely
+# visual feedback.
 # ─────────────────────────────────────────
-def _tray_mask(frame):
-    """Bright-pixel mask restricted to CAUTION zone. Exposed for debug window."""
-    fh, fw = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 5)
-    gray = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
-    _, mask = cv2.threshold(gray, TRAY_BRIGHTNESS_THRESH, 255, cv2.THRESH_BINARY)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5, 5),   np.uint8))
-    work = np.zeros_like(mask)
-    cx1, cy1, cx2, cy2 = CAUTION_ZONE
-    work[max(0,cy1):min(fh,cy2), max(0,cx1):min(fw,cx2)] = 255
-    return cv2.bitwise_and(mask, work)
+# Mouse-callback state. center=(x,y) on first mousedown; radius grows
+# while you drag; commit=True after the user presses Enter/Space.
+_sel = {"center": None, "radius": 0, "dragging": False, "commit": False}
 
-def find_tray(frame, draw_on=None):
-    """Most circular bright blob in CAUTION zone. Returns (robot_x, robot_y) or None."""
-    mask = _tray_mask(frame)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best, best_score = None, 0
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if not (TRAY_MIN_AREA <= area <= TRAY_MAX_AREA):
-            continue
-        perim = cv2.arcLength(cnt, True)
-        if perim < 1:
-            continue
-        circ = 4 * np.pi * area / (perim * perim)
-        if circ < TRAY_MIN_CIRCULARITY:
-            continue
-        score = area * circ
-        if score > best_score:
-            best_score, best = score, (cnt, circ)
-    if best is None:
-        return None
-    cnt, circ = best
-    M = cv2.moments(cnt)
-    if M["m00"] == 0:
-        return None
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    (_, _), radius = cv2.minEnclosingCircle(cnt)
-    rx, ry = pixel_to_robot(cx, cy, H_matrix)
-    if draw_on is not None:
-        cv2.circle(draw_on, (cx, cy), int(radius), (200, 200, 200), 2)
-        cv2.circle(draw_on, (cx, cy), 6, (255, 0, 255), -1)
-        cv2.putText(draw_on, f"TRAY ({circ:.2f})", (cx - 50, cy - int(radius) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 2)
-    return (rx, ry)
+def _tray_mouse_cb(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _sel["center"]   = (x, y)
+        _sel["radius"]   = 0
+        _sel["dragging"] = True
+        _sel["commit"]   = False
+    elif event == cv2.EVENT_MOUSEMOVE and _sel["dragging"]:
+        cx, cy = _sel["center"]
+        _sel["radius"] = int(((x - cx) ** 2 + (y - cy) ** 2) ** 0.5)
+    elif event == cv2.EVENT_LBUTTONUP and _sel["dragging"]:
+        _sel["dragging"] = False
+        cx, cy = _sel["center"]
+        _sel["radius"] = max(_sel["radius"],
+                             int(((x - cx) ** 2 + (y - cy) ** 2) ** 0.5))
 
-def phase_detect_tray():
-    """Lock the tray over a few stable frames; fall back to fixed drop on timeout."""
-    if not USE_TRAY_DETECTION:
-        print(f"[PHASE 1] Tray detection OFF. Using fixed drop {DROP_FALLBACK_ROBOT_XY}.")
-        return [DROP_FALLBACK_ROBOT_XY]
-    print("\n[PHASE 1] Looking for the tray...")
-    stable, last_xy, attempts = 0, None, 0
-    while attempts < 150:                     # ~5s at 30fps
-        attempts += 1
+def manual_select_tray():
+    """
+    Block until the user draws a circle around the tray and confirms.
+    Controls (on the "Detection" window):
+        Click + drag : draw circle (1st click = center, drag out = radius)
+        Enter / Space: confirm the current circle
+        R            : reset and draw again
+    No cancel — the program cannot continue without a drop point.
+    Returns [(robot_x, robot_y)] for the circle's center.
+    """
+    print("\n[PHASE 1] MANUAL TRAY SELECTION")
+    print("  In the 'Detection' window: click the tray's center and drag")
+    print("  outward to set its radius. Press ENTER or SPACE to confirm.")
+    print("  Press R to redo.")
+    cv2.namedWindow("Detection")
+    cv2.setMouseCallback("Detection", _tray_mouse_cb)
+    _sel["center"] = None
+    _sel["radius"] = 0
+    _sel["dragging"] = False
+    _sel["commit"] = False
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             continue
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         display = frame.copy()
-        draw_zones(display)
-        if TRAY_DEBUG_MASK:
-            cv2.imshow("Tray Mask (debug)", _tray_mask(frame))
-        tray = find_tray(frame, draw_on=display)
-        if tray is not None:
-            rx, ry = tray
-            if last_xy and abs(rx-last_xy[0]) < 15 and abs(ry-last_xy[1]) < 15:
-                stable += 1
-            else:
-                stable = 0
-            last_xy = (rx, ry)
-            cv2.putText(display, f"TRAY LOCK: {stable}/15", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-            if stable >= 15:
-                print(f"Tray locked at robot ({rx:.1f}, {ry:.1f}).")
-                return [(rx, ry)]
+        # Zones intentionally NOT drawn here — they'd just clutter the tray
+        # picking UI. They come on after target detection (zone editor phase).
+
+        if _sel["center"] is not None and _sel["radius"] > 0:
+            cv2.circle(display, _sel["center"], _sel["radius"],
+                       (255, 0, 255), 2)
+            cv2.circle(display, _sel["center"], 5, (255, 0, 255), -1)
+
+        if _sel["center"] is None:
+            msg = "Click the tray center and drag out to set radius"
+        elif _sel["dragging"]:
+            msg = f"Radius: {_sel['radius']} px  (release to lock)"
         else:
-            cv2.putText(display, "Searching for tray...", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            msg = "ENTER/SPACE = confirm    R = redo"
+        cv2.putText(display, msg, (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         cv2.imshow("Detection", display)
-        cv2.waitKey(1)
-    print(f"No tray locked. Using fallback drop {DROP_FALLBACK_ROBOT_XY}.")
-    return [DROP_FALLBACK_ROBOT_XY]
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (13, 32):                       # Enter or Space
+            if _sel["center"] is not None and _sel["radius"] > 0 \
+                    and not _sel["dragging"]:
+                cx, cy = _sel["center"]
+                rx, ry = pixel_to_robot(cx, cy, H_matrix)
+                print(f"Tray locked at pixel ({cx},{cy}) "
+                      f"-> robot ({rx:.1f}, {ry:.1f}).")
+                # Clear our callback so it doesn't fight later windows.
+                cv2.setMouseCallback("Detection", lambda *a, **k: None)
+                return [(rx, ry)]
+            else:
+                print("No circle drawn yet — draw one first.")
+        elif key in (ord('r'), ord('R')):
+            _sel["center"]   = None
+            _sel["radius"]   = 0
+            _sel["dragging"] = False
+            print("Tray selection reset.")
+
+def phase_detect_tray():
+    """Manual selection only — no auto-detection."""
+    return manual_select_tray()
 
 # ─────────────────────────────────────────
 # PHASE 2: DETECT TARGETS
 # ─────────────────────────────────────────
 def phase_detect_targets():
-    print("\n[PHASE 2] Scanning for targets...")
+    """PHASE 2 — find the red blocks. Hand detection is OFF here on purpose:
+    we just want a clean view of the scene so blocks lock in faster, and no
+    MediaPipe inference is wasted while the arm is still idle."""
+    print("\n[PHASE 2] Scanning for targets... (hand detection OFF)")
     stability_counter = 0
     last_count = 0
     while True:
@@ -373,7 +452,8 @@ def phase_detect_targets():
         if not ret: continue
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         display_frame = frame.copy()
-        draw_zones(display_frame)
+        # Zones intentionally NOT drawn here — they'd just clutter the
+        # detection UI. They come on after target lock (zone editor phase).
 
         current_list = find_red_objects(frame, draw_on=display_frame)
 
@@ -384,17 +464,177 @@ def phase_detect_targets():
             last_count = len(current_list)
 
         progress = int((stability_counter/STABILITY_LIMIT)*100)
-        cv2.putText(display_frame, f"LOCKING TARGETS: {progress}%", (20,40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-        cv2.putText(display_frame, "Press M for manual control", (20, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+        cv2.putText(display_frame,
+                    f"LOCKING TARGETS: {progress}%  ({len(current_list)} found)",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, "HAND DETECTION: OFF",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
         cv2.imshow("Detection", display_frame)
-        if (cv2.waitKey(1) & 0xFF) == ord('m'):     # operator takes over mid-run
-            manualControl.manual_control_loop(api, cap, "Detection")
+        cv2.waitKey(1)
 
         if stability_counter >= STABILITY_LIMIT:
             print(f"Locked {len(current_list)} targets.")
             return current_list
+
+
+# ─────────────────────────────────────────
+# ZONE EDITOR (Phase 2.5) — interactive
+# Ports the D/C/H/M keybindings from hand_detection.py's standalone demo
+# so the operator can resize or drag the safety zones live, on top of a
+# running hand-detection preview. The same window is reused.
+# ─────────────────────────────────────────
+# Mouse-callback state (lives at module scope so the cv2 callback can write
+# to it). Two modes:
+#   edit_target  None | "DANGER" | "CAUTION" | "HANDOFF"
+#       → click two opposite corners to redraw the zone
+#   move_target  same set
+#       → click+drag inside the zone to move it without resizing
+_zedit = {
+    "edit_target": None,
+    "move_target": None,
+    "corner1":     None,    # first click during a redraw
+    "mouse_pos":   (0, 0),  # latest cursor location (for live preview)
+    "moving":      False,   # mouse currently held during a move
+    "grab_off":    (0, 0),  # offset from zone top-left to grab point
+}
+
+def _zone_for(target):
+    if target == "DANGER":  return DANGER_ZONE
+    if target == "CAUTION": return CAUTION_ZONE
+    if target == "HANDOFF": return HANDOFF_ZONE
+    return None
+
+def _set_zone(target, rect):
+    """Overwrite the global tuple for `target`."""
+    global DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE
+    if target == "DANGER":  DANGER_ZONE  = rect
+    if target == "CAUTION": CAUTION_ZONE = rect
+    if target == "HANDOFF": HANDOFF_ZONE = rect
+
+def _zone_editor_mouse_cb(event, x, y, flags, param):
+    z = _zedit
+    z["mouse_pos"] = (x, y)
+
+    # ── MOVE mode ─────────────────────────────────────────────────
+    if z["move_target"] is not None:
+        zx1, zy1, zx2, zy2 = _zone_for(z["move_target"])
+        if event == cv2.EVENT_LBUTTONDOWN and zx1 <= x <= zx2 and zy1 <= y <= zy2:
+            z["moving"]   = True
+            z["grab_off"] = (x - zx1, y - zy1)
+        elif event == cv2.EVENT_MOUSEMOVE and z["moving"]:
+            w_box, h_box = zx2 - zx1, zy2 - zy1
+            nx1, ny1 = x - z["grab_off"][0], y - z["grab_off"][1]
+            _set_zone(z["move_target"],
+                      (nx1, ny1, nx1 + w_box, ny1 + h_box))
+        elif event == cv2.EVENT_LBUTTONUP and z["moving"]:
+            z["moving"]     = False
+            z["move_target"] = None
+        return
+
+    # ── REDRAW (resize) mode ──────────────────────────────────────
+    if z["edit_target"] is None:
+        return
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if z["corner1"] is None:
+            z["corner1"] = (x, y)
+        else:
+            x1, y1 = z["corner1"]
+            rect = (min(x1, x), min(y1, y), max(x1, x), max(y1, y))
+            if rect[2] - rect[0] > 15 and rect[3] - rect[1] > 15:
+                _set_zone(z["edit_target"], rect)
+            z["edit_target"] = None
+            z["corner1"]     = None
+
+def phase_setup_zones():
+    """
+    [PHASE 2.5] Show zones for the first time + let the user edit them
+    AND warm up MediaPipe so hand detection is live before the arm moves.
+
+    Keys (same as hand_detection.py's standalone demo, plus ENTER):
+        D       → redraw DANGER  zone (then click two opposite corners)
+        C       → redraw CAUTION zone (then click two opposite corners)
+        H       → redraw HANDOFF zone (then click two opposite corners)
+        M       → MOVE HANDOFF (drag the box without resizing it)
+        ESC     → cancel any in-progress edit/move
+        ENTER / SPACE → finish setup, start picking
+    """
+    print("\n[PHASE 2.5] Zone setup + arming hand detection.")
+    print("  D / C / H = redraw DANGER / CAUTION / HANDOFF (click 2 corners)")
+    print("  M = move HANDOFF (drag the box)")
+    print("  ESC = cancel an edit/move    ENTER or SPACE = done, start picking")
+
+    cv2.namedWindow("Detection")
+    cv2.setMouseCallback("Detection", _zone_editor_mouse_cb)
+    _zedit["edit_target"] = None
+    _zedit["move_target"] = None
+    _zedit["corner1"]     = None
+    _zedit["moving"]      = False
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        display = frame.copy()
+
+        # Live hand detection so MediaPipe warms up AND the user sees zones
+        # responding to their hand in real time.
+        zone, _, _, display = hd.detect_zone_and_gesture(
+            display, DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE, draw=True)
+
+        draw_zones(display)
+
+        # ── Edit-mode preview (yellow box from first corner to cursor) ──
+        if _zedit["edit_target"] is not None:
+            if _zedit["corner1"] is None:
+                hint = f"EDIT {_zedit['edit_target']}: click FIRST corner   (ESC cancels)"
+            else:
+                hint = f"EDIT {_zedit['edit_target']}: click SECOND corner   (ESC cancels)"
+                cv2.rectangle(display, _zedit["corner1"],
+                              _zedit["mouse_pos"], (255, 255, 0), 2)
+            cv2.putText(display, hint, (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        elif _zedit["move_target"] is not None:
+            cv2.putText(display,
+                        f"MOVE {_zedit['move_target']}: click inside the box and drag  (ESC cancels)",
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+        else:
+            cv2.putText(display,
+                        "[D]anger  [C]aution  [H]andoff = redraw   [M] move HANDOFF",
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(display,
+                        "ENTER / SPACE = done, start picking",
+                        (10, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        cv2.putText(display, f"hands: {zone}", (10, display.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.imshow("Detection", display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 255:
+            continue
+        if key in (13, 32):                    # Enter / Space → done
+            cv2.setMouseCallback("Detection", lambda *a, **k: None)
+            print(f"[PHASE 2.5] Zones locked. DANGER={DANGER_ZONE} "
+                  f"CAUTION={CAUTION_ZONE} HANDOFF={HANDOFF_ZONE}")
+            return
+        elif key == 27:                        # Esc → cancel any in-progress edit
+            _zedit["edit_target"] = None
+            _zedit["move_target"] = None
+            _zedit["corner1"]     = None
+            _zedit["moving"]      = False
+        elif key == ord('d'):
+            _zedit["edit_target"] = "DANGER";  _zedit["corner1"] = None
+        elif key == ord('c'):
+            _zedit["edit_target"] = "CAUTION"; _zedit["corner1"] = None
+        elif key == ord('h'):
+            _zedit["edit_target"] = "HANDOFF"; _zedit["corner1"] = None
+        elif key == ord('m'):
+            _zedit["move_target"] = "HANDOFF"; _zedit["edit_target"] = None
+
+# Backwards-compat alias: anything that used to call phase_arm_hand_detection
+# now gets the zone editor (which also warms up MediaPipe).
+phase_arm_hand_detection = phase_setup_zones
 
 def phase_detect_targets_quick(frame):
     return find_red_objects(frame)
@@ -407,41 +647,40 @@ def phase_execute_batch(api, pick_list, drop_list):
     if len(pick_list) == 0 or len(drop_list) == 0:
         print("Missing targets or drop zones, aborting.")
         return False
-    batch_size = len(pick_list)            # pick EVERY detected object
+    batch_size = min(len(pick_list), len(drop_list))
     print(f"\n[PHASE 3] Executing {batch_size} operations.")
 
     for i in range(batch_size):
-        pick_x, pick_y, pick_ang = pick_list[i]
-        rhead = gripper_angle(pick_ang)    # rotate gripper to match the part
-        drop_x, drop_y = drop_list[0]      # everything goes to the one tray (unless handed off)
-        print(f"Task {i+1}: ({pick_x:.1f},{pick_y:.1f}) ang={pick_ang:.0f} rHead={rhead:.0f} -> ({drop_x:.1f},{drop_y:.1f})")
+        pick_x, pick_y = pick_list[i]
+        drop_x, drop_y = drop_list[i]
+        print(f"Task {i+1}: ({pick_x:.1f},{pick_y:.1f}) -> ({drop_x:.1f},{drop_y:.1f})")
 
         ret, frame = cap.read()
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         monitor_humans(frame)   # peace->wave, DANGER->stop, WARNING->slow
 
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, rhead)
+        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         ret, frame = cap.read()
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         monitor_humans(frame)
 
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK, rhead)
+        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
         dobotArm.close_gripper(api)
         time.sleep(0.5)
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, rhead)
+        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         # Jidoka pick check
         ret, frame = cap.read()
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         remaining = phase_detect_targets_quick(frame)
-        pick_failed = any(abs(rx-pick_x)<20 and abs(ry-pick_y)<20 for rx,ry,_a in remaining)
+        pick_failed = any(abs(rx-pick_x)<20 and abs(ry-pick_y)<20 for rx,ry in remaining)
         if pick_failed:
             print("JIDOKA - Pick failed, retrying...")
-            dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK, rhead)
+            dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
             dobotArm.close_gripper(api)
             time.sleep(0.5)
-            dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, rhead)
+            dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         # Handoff or default drop
         ret, frame = cap.read()
@@ -480,6 +719,9 @@ drop_zone = phase_detect_tray()
 while machine_state == "scanning target":
     pick_target = phase_detect_targets()
     if pick_target is not None:
+        # Now that we have the blocks locked, turn hand detection ON
+        # before the arm starts moving.
+        phase_arm_hand_detection()
         next_state()
 
 while machine_state == "pick place":
