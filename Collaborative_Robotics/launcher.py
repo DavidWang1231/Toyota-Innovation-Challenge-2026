@@ -40,19 +40,11 @@ TOOLS = [
     },
     {
         "section": "OPERATOR",
-        "name":    "Fatigue Monitor",
-        "file":    "fatigue_monitor.py",
-        "desc":    "Laptop webcam: detects drowsy operators via eye-closure "
-                   "and yawn tracking. Shows alerts when attention drops.",
-        "color":   "amber",
-    },
-    {
-        "section": "CALIBRATION",
-        "name":    "Camera Intrinsics",
-        "file":    "calibrateCamera.py",
-        "args":    ["--calibrate"],
-        "desc":    "Re-calibrate camera lens distortion with an ArUco board. "
-                   "Only run if camera_params.npz is wrong.",
+        "name":    "Operator Monitor",
+        "file":    "operator_monitor.py",
+        "desc":    "Laptop webcam: identifies the operator from photos in "
+                   "operators/ AND runs fatigue detection on the same feed. "
+                   "Press T for the task dashboard.",
         "color":   "amber",
     },
     {
@@ -65,26 +57,10 @@ TOOLS = [
     },
     {
         "section": "TOOLS",
-        "name":    "Red Object Tracker",
-        "file":    "red_object_tracker.py",
-        "desc":    "Live HSV tuner + tight contour tracking. Prints pixel "
-                   "and robot coordinates for any red object.",
-        "color":   "green",
-    },
-    {
-        "section": "TOOLS",
         "name":    "Manual Control",
         "file":    "manualControl.py",
         "desc":    "Drive the robot manually. Useful for finding handoff "
                    "coordinates or recovering from a stuck state.",
-        "color":   "green",
-    },
-    {
-        "section": "TOOLS",
-        "name":    "Test Dobot",
-        "file":    "testDobot.py",
-        "desc":    "Sanity check: arm moves and gripper opens/closes. "
-                   "Run first if something is broken.",
         "color":   "green",
     },
 ]
@@ -178,67 +154,89 @@ HTML = """<!DOCTYPE html>
 
   /* ── Splash / connect screen ──────────────────────────── */
   #splash { position: fixed; inset: 0; z-index: 100;
-            background: radial-gradient(circle at 50% 40%, #1a1d24 0%, #0e1015 70%);
+            background: radial-gradient(circle at 50% 50%, #1a1d24 0%, #0a0c10 80%);
             display: flex; flex-direction: column; align-items: center;
-            justify-content: center; gap: 36px;
+            justify-content: center;
             transition: opacity .5s ease, visibility .5s ease; }
   #splash.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
-  #splash .label { color: var(--text-dim); font-size: 12px;
-                   letter-spacing: .3em; text-transform: uppercase; }
-  #splash h1 { margin: 0; font-size: 36px; font-weight: 700; color: var(--text); }
-  #splash h1 span { color: var(--accent); }
+
+
+  /* Radar (full-screen, behind everything) */
   #splash .pulse-wrap { position: absolute; inset: 0;
                          display: flex; align-items: center; justify-content: center;
                          pointer-events: none; overflow: hidden; z-index: 0; }
   #splash .pulse-wrap .ring {
       position: absolute; top: 50%; left: 50%;
-      width: 120px; height: 120px;
-      margin-top: -60px; margin-left: -60px;
+      width: 180px; height: 180px;
+      margin-top: -90px; margin-left: -90px;
       border: 2px solid var(--accent);
       border-radius: 50%; opacity: 0;
-      animation: radar 4s ease-out infinite;
+      animation: radar 4.5s ease-out infinite;
   }
-  #splash .pulse-wrap .ring:nth-child(2) { animation-delay: 0.8s; }
-  #splash .pulse-wrap .ring:nth-child(3) { animation-delay: 1.6s; }
-  #splash .pulse-wrap .ring:nth-child(4) { animation-delay: 2.4s; }
-  #splash .pulse-wrap .ring:nth-child(5) { animation-delay: 3.2s; }
-  #splash .pulse-wrap .core {
-      width: 24px; height: 24px; border-radius: 50%;
-      background: var(--accent);
-      box-shadow: 0 0 36px var(--accent);
-      animation: corepulse 1.6s ease-in-out infinite;
-      z-index: 1;
-  }
-  /* All splash content sits above the radar */
+  #splash .pulse-wrap .ring:nth-child(2) { animation-delay: 0.9s; }
+  #splash .pulse-wrap .ring:nth-child(3) { animation-delay: 1.8s; }
+  #splash .pulse-wrap .ring:nth-child(4) { animation-delay: 2.7s; }
+  #splash .pulse-wrap .ring:nth-child(5) { animation-delay: 3.6s; }
   #splash > *:not(.pulse-wrap) { position: relative; z-index: 2; }
   @keyframes radar {
-      0%   { transform: scale(0.2);  opacity: 0.85; }
+      0%   { transform: scale(0.15); opacity: 0.9; }
       80%  { opacity: 0.06; }
       100% { transform: scale(20);   opacity: 0; }
   }
-  @keyframes corepulse {
-      0%, 100% { transform: scale(1);   filter: brightness(1); }
-      50%      { transform: scale(1.2); filter: brightness(1.4); }
-  }
+
+  /* Hero: logo + brand text side-by-side, slightly left of center */
+  #splash .hero { display: flex; flex-direction: column; align-items: center;
+                  gap: 56px; }
+  #splash .hero .lockup { display: flex; flex-direction: row;
+                          align-items: center; justify-content: center;
+                          gap: 14px;
+                          /* shift left of dead-center a bit */
+                          margin-left: -40px; }
+  #splash .hero img.tmmc-logo { height: 160px; width: auto;
+                                 filter: drop-shadow(0 4px 24px rgba(229,57,53,0.25)); }
+  #splash .hero .brand-text { color: #fff; font-weight: 600;
+                              font-size: 36px; line-height: 1.08;
+                              letter-spacing: -0.01em; text-align: left; }
+  /* Fallback text logo if image fails */
+  #splash .hero .lockup.broken img.tmmc-logo { display: none; }
+  #splash .hero .lockup .fallback { display: none; background: var(--accent);
+                                     color: #fff; font-weight: 800;
+                                     font-size: 30px; letter-spacing: .12em;
+                                     padding: 18px 26px; border-radius: 10px;
+                                     box-shadow: 0 8px 32px rgba(229,57,53,0.45); }
+  #splash .hero .lockup.broken .fallback { display: block; }
+
   #connectBtn { background: var(--accent); color: #fff; border: 0;
-                padding: 16px 56px; font-size: 16px; font-weight: 700;
-                letter-spacing: .08em; border-radius: 8px; cursor: pointer;
-                box-shadow: 0 6px 20px rgba(229,57,53,0.35);
+                padding: 18px 72px; font-size: 15px; font-weight: 700;
+                letter-spacing: .25em; border-radius: 8px; cursor: pointer;
+                box-shadow: 0 6px 24px rgba(229,57,53,0.4);
                 transition: transform .08s ease, filter .15s ease,
                             box-shadow .15s ease; }
   #connectBtn:hover  { filter: brightness(1.1);
-                       box-shadow: 0 8px 28px rgba(229,57,53,0.55); }
+                       box-shadow: 0 10px 36px rgba(229,57,53,0.6); }
   #connectBtn:active { transform: translateY(1px); }
-  #splash .meta { color: var(--text-dim); font-size: 12px; }
+
+  #splash .meta { position: absolute; bottom: 32px; left: 50%;
+                  transform: translateX(-50%);
+                  color: var(--text-dim); font-size: 11px;
+                  letter-spacing: .15em; text-transform: uppercase; }
 
   /* ── Main dashboard ───────────────────────────────────── */
-  header { padding: 28px 36px 16px; border-bottom: 1px solid var(--border); }
-  header h1 { margin: 0; font-size: 28px; font-weight: 700;
-              display: flex; align-items: baseline; gap: 12px; }
-  header h1 .sub { color: var(--text); font-weight: 400; font-size: 18px; }
-  header .meta { float: right; color: var(--text-dim); font-size: 12px;
-                 margin-top: 12px; }
-  header p { color: var(--text-dim); margin: 4px 0 0; font-size: 13px; }
+  header { padding: 22px 36px 16px; border-bottom: 1px solid var(--border); }
+  header .tmmc-banner { display: flex; align-items: center; gap: 18px; }
+  header .tmmc-banner .logo { height: 44px; width: auto; flex-shrink: 0;
+                               background: #fff; padding: 4px 8px;
+                               border-radius: 6px; }
+  header .tmmc-banner .title-block { flex: 1; }
+  header .tmmc-banner .kicker { color: var(--text-dim); font-size: 10px;
+                                 letter-spacing: .22em; text-transform: uppercase;
+                                 margin-bottom: 2px; }
+  header .tmmc-banner h1 { margin: 0; font-size: 22px; font-weight: 700;
+                            color: var(--text); }
+  header .tmmc-banner .meta { color: var(--text-dim); font-size: 11px;
+                               letter-spacing: .14em; text-transform: uppercase; }
+  header p { color: var(--text-dim); margin: 10px 0 0; font-size: 12px;
+             padding-left: 62px; }
 
   main { padding: 24px 28px 80px; display: grid;
          grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
@@ -290,23 +288,37 @@ HTML = """<!DOCTYPE html>
 
 <!-- ── Splash / connect screen ─────────────────────────── -->
 <div id="splash">
-  <div class="label">Toyota Innovation Challenge 2026</div>
-  <h1>Collaborative <span>Robotics</span></h1>
   <div class="pulse-wrap">
     <div class="ring"></div>
     <div class="ring"></div>
     <div class="ring"></div>
     <div class="ring"></div>
     <div class="ring"></div>
-    <div class="core"></div>
   </div>
-  <button id="connectBtn">CONNECT</button>
-  <div class="meta">Local control center · 127.0.0.1</div>
+
+  <div class="hero">
+    <div class="lockup" id="lockup">
+      <img class="tmmc-logo" src="/static/tmmc_logo.png?v=__CACHEBUST__" alt="TMMC"
+           onerror="document.getElementById('lockup').classList.add('broken')">
+      <div class="fallback">TMMC</div>
+      <div class="brand-text">Toyota Motor<br>Manufacturing<br>Canada Inc.</div>
+    </div>
+    <button id="connectBtn">CONNECT</button>
+  </div>
+
+  <div class="meta">Collaborative Robotics · Innovation Challenge 2026 · 127.0.0.1</div>
 </div>
 
 <header>
-  <span class="meta">Toyota Innovation Challenge 2026</span>
-  <h1><span class="sub">Collaborative Robotics Control Center</span></h1>
+  <div class="tmmc-banner">
+    <img class="logo" src="/static/tmmc_logo.png?v=__CACHEBUST__" alt="TMMC"
+         onerror="this.style.display='none'">
+    <div class="title-block">
+      <div class="kicker">Collaborative Robotics</div>
+      <h1>Control Center</h1>
+    </div>
+    <span class="meta">Innovation Challenge 2026</span>
+  </div>
   <p>Click any card to launch a script. Click again to stop it.</p>
 </header>
 <main id="cards"></main>
@@ -417,12 +429,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/" or url.path == "/index.html":
+            import time as _t
             tools_safe = [{k: v for k, v in t.items() if k != "args"} for t in TOOLS]
             html = HTML.replace("__TOOLS_JSON__", json.dumps(tools_safe))
+            html = html.replace("__CACHEBUST__", str(int(_t.time())))
             return self._send_html(html)
         if url.path == "/api/status":
             return self._send_json(200, {"running": _running_files()})
+        if url.path.startswith("/static/"):
+            return self._serve_static(url.path[len("/static/"):])
         self.send_response(404); self.end_headers()
+
+    def _serve_static(self, name):
+        # Only serve files from the script directory, no traversal
+        if "/" in name or ".." in name:
+            self.send_response(404); self.end_headers(); return
+        path = SCRIPT_DIR / name
+        if not path.exists() or not path.is_file():
+            self.send_response(404); self.end_headers(); return
+        # naive content-type
+        ct = ("image/png"  if name.lower().endswith(".png")  else
+              "image/jpeg" if name.lower().endswith((".jpg",".jpeg")) else
+              "image/svg+xml" if name.lower().endswith(".svg") else
+              "application/octet-stream")
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(data)))
+        # No caching — so if the user replaces the file, it loads fresh.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         url = urlparse(self.path)
