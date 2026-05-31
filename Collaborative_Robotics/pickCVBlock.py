@@ -1,9 +1,12 @@
+import os
 import dobotArm
 import lib.DobotDllType as dType
 import numpy as np
 import cv2
 import time
-import mediapipe as mp
+import hand_detection as hd
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 """CONSTANTS"""
 Z_SAFE = 40
@@ -11,12 +14,11 @@ Z_PICK = -25
 STABILITY_LIMIT = 60
 
 # ── Zones (scaled for 640x480 camera) ──
-# HANDOFF: bottom-right corner, worker reaches here
-HANDOFF_ZONE = (400, 300, 620, 460)
-# CAUTION: large area around robot, robot SLOWS
-CAUTION_ZONE = (120, 80, 520, 440)
-# DANGER: tight area at robot center, robot STOPS
-DANGER_ZONE  = (220, 150, 420, 360)
+# Adjust these rectangles to match where your robot actually sits in the
+# camera view. Coordinates are (x1, y1, x2, y2) in pixels.
+HANDOFF_ZONE = (450, 280, 640, 480)   # bottom-right, worker reaches here
+CAUTION_ZONE = (40,  80, 600, 470)    # whole workspace; outside = ignored
+DANGER_ZONE  = (80, 150, 340, 460)    # tight box around the Dobot body
 
 # Handoff Zone robot coordinates - adjust on competition day
 HANDOFF_ROBOT_X = 180
@@ -30,8 +32,8 @@ cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
 if not cap.isOpened():
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
-H_matrix = np.load("HomographyMatrix.npy")
-data = np.load("./camera_params.npz")
+H_matrix = np.load(os.path.join(SCRIPT_DIR, "HomographyMatrix.npy"))
+data = np.load(os.path.join(SCRIPT_DIR, "camera_params.npz"))
 camera_matrix = data["camera_matrix"]
 dist_coeffs   = data["dist_coeffs"]
 
@@ -40,93 +42,17 @@ h, w = frame.shape[:2]
 new_K, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w,h), 1)
 map1, map2 = cv2.initUndistortRectifyMap(camera_matrix, dist_coeffs, None, new_K, (w,h), cv2.CV_16SC2)
 
-# --- MEDIAPIPE INIT (hands + pose) ---
-mp_hands = mp.solutions.hands
-mp_pose  = mp.solutions.pose
-mp_draw  = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=4, model_complexity=1,
-                       min_detection_confidence=0.5, min_tracking_confidence=0.5)
-pose  = mp_pose.Pose(model_complexity=0,
-                     min_detection_confidence=0.7, min_tracking_confidence=0.7)
-
-# Pose: elbows + wrists only (forearm). 13=L elbow,14=R elbow,15=L wrist,16=R wrist
-POSE_BODY_LANDMARKS = [13, 14, 15, 16]
-POSE_FOREARM_PAIRS  = [(13, 15), (14, 16)]
-POSE_VIS_THRESHOLD  = 0.7
-# Fingertips: thumb,index,middle,ring,pinky
-HAND_FINGERTIPS  = [4, 8, 12, 16, 20]
-POINTER_FINGERTIP = 8
-
 # ─────────────────────────────────────────
-# ZONE LOGIC
+# ZONE / HAND DETECTION  (delegates to hand_detection.py)
+# Hands-only (no pose) - the white Dobot was triggering pose's "forearm"
+# detector, which made check_hands constantly return DANGER and froze the
+# pick loop. The hand_detection module avoids this entirely.
 # ─────────────────────────────────────────
-def get_zone(cx, cy):
-    hx1, hy1, hx2, hy2 = HANDOFF_ZONE
-    dx1, dy1, dx2, dy2 = DANGER_ZONE
-    cx1, cy1, cx2, cy2 = CAUTION_ZONE
-    if hx1 < cx < hx2 and hy1 < cy < hy2:
-        return "HANDOFF"
-    if dx1 < cx < dx2 and dy1 < cy < dy2:
-        return "DANGER"
-    if cx1 < cx < cx2 and cy1 < cy < cy2:
-        return "WARNING"
-    return "NONE"
-
 def detect_zone(frame):
-    """
-    Full hand + forearm + fingertip detection.
-    Returns (zone_string, annotated_frame).
-    """
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    hand_result = hands.process(rgb)
-    pose_result = pose.process(rgb)
-
-    all_zones = []
-    fh, fw = frame.shape[:2]
-
-    # Pose forearm (elbow -> wrist)
-    if pose_result.pose_landmarks:
-        lms = pose_result.pose_landmarks.landmark
-        for elbow_i, wrist_i in POSE_FOREARM_PAIRS:
-            e, wr = lms[elbow_i], lms[wrist_i]
-            if e.visibility < POSE_VIS_THRESHOLD or wr.visibility < POSE_VIS_THRESHOLD:
-                continue
-            ex, ey = int(e.x*fw), int(e.y*fh)
-            wx, wy = int(wr.x*fw), int(wr.y*fh)
-            cv2.line(frame, (ex,ey), (wx,wy), (0,200,255), 3)
-        for idx in POSE_BODY_LANDMARKS:
-            plm = lms[idx]
-            if plm.visibility < POSE_VIS_THRESHOLD:
-                continue
-            px, py = int(plm.x*fw), int(plm.y*fh)
-            all_zones.append(get_zone(px, py))
-            cv2.circle(frame, (px,py), 8, (0,200,255), -1)
-
-    # Hands fingertips
-    if hand_result.multi_hand_landmarks:
-        for lm in hand_result.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
-            for tip_idx in HAND_FINGERTIPS:
-                tx = int(lm.landmark[tip_idx].x * fw)
-                ty = int(lm.landmark[tip_idx].y * fh)
-                all_zones.append(get_zone(tx, ty))
-                if tip_idx == POINTER_FINGERTIP:
-                    cv2.circle(frame, (tx,ty), 10, (255,255,255), -1)
-                    cv2.circle(frame, (tx,ty), 5, (0,0,255), -1)
-                else:
-                    cv2.circle(frame, (tx,ty), 4, (255,255,255), -1)
-
-    if "DANGER" in all_zones:
-        return "DANGER", frame
-    elif "HANDOFF" in all_zones:
-        return "HANDOFF", frame
-    elif "WARNING" in all_zones:
-        return "WARNING", frame
-    return "NONE", frame
+    return hd.detect_zone(frame, DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE, draw=True)
 
 def check_hands(frame):
-    """Lightweight wrapper returning just the zone string."""
-    zone, _ = detect_zone(frame)
+    zone, _ = hd.detect_zone(frame, DANGER_ZONE, CAUTION_ZONE, HANDOFF_ZONE, draw=False)
     return zone
 
 def draw_zones(frame):
