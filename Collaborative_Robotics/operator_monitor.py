@@ -193,11 +193,11 @@ class OperatorDB:
                 continue
             img = cv2.imread(str(path))
             if img is None:
-                print(f"[OperatorDB]  [x] couldn't read {path.name}")
+                print(f"[OperatorDB]  ✗ couldn't read {path.name}")
                 continue
             emb = self.faceid.encode_from_bgr(img)
             if emb is None:
-                print(f"[OperatorDB]  [x] no face found in {path.name}")
+                print(f"[OperatorDB]  ✗ no face found in {path.name}")
                 continue
             name = path.stem
             self.operators[name] = {
@@ -206,7 +206,7 @@ class OperatorDB:
                 "role":  meta.get(name, {}).get("role",  ""),
                 "tasks": meta.get(name, {}).get("tasks", []),
             }
-            print(f"[OperatorDB]  [OK] enrolled {name}")
+            print(f"[OperatorDB]  ✓ enrolled {name}")
 
         if not self.operators:
             print("[OperatorDB] No faces enrolled. Add photos to operators/.")
@@ -1055,9 +1055,6 @@ def main(camera_index=0):
     if not cap.isOpened():
         print(f"ERROR: cannot open camera at index {camera_index}")
         return
-    # Keep the capture small so the window doesn't fill the whole screen.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
     # Short warm-up: most cameras deliver a frame within a few tries.
     for _ in range(8):
         ok, _ = cap.read()
