@@ -64,7 +64,7 @@ TOOLS = [
         "desc":    "Drive the robot arm manually to find or recover positions.",
         "color":   "green",
         "actions": [
-            {"label": "Launch", "file": "manualControl.py"},
+            {"label": "Launch", "file": "runManual.py"},
         ],
     },
 ]
