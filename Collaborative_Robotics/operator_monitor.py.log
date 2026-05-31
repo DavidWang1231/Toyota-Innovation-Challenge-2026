@@ -1,0 +1,18 @@
+¡ú Loading dlib face recognition ...
+  done (0.0s)
+¡ú Enrolling operators from C:\Users\wangj\Desktop\Toyota-Innovation-Challenge-2026-master\Collaborative_Robotics\operators/ ...
+[OperatorDB] CSV: loaded 4 role/task entries
+[OperatorDB]  [OK] enrolled David
+[OperatorDB]  [OK] enrolled Heidi
+[OperatorDB]  [OK] enrolled Justin
+[OperatorDB]  [OK] enrolled Steven
+  done (19.1s) ¡ª ['David', 'Heidi', 'Justin', 'Steven']
+¡ú Opening camera + MediaPipe ...
+  done (25.3s)
+
+Ready in 44.4s.
+Click the window to dismiss fatigue warnings for 30s.
+
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+Running. Keys:  T tasks | R reset | Q quit  (use + / E / X buttons in the panel)
+
