@@ -250,6 +250,94 @@ def detect_zone(frame, danger_zone, caution_zone, handoff_zone, draw=True):
 
 
 # ─────────────────────────────────────────────────────────
+# GESTURE DETECTION — peace / V sign (index + middle up, ring + pinky down)
+# ─────────────────────────────────────────────────────────
+def _fingers_extended(lm):
+    """
+    Return [thumb, index, middle, ring, pinky] booleans.
+    A finger is 'extended' when its tip is farther from the wrist than its
+    PIP joint. This distance-based test is orientation-independent, so it
+    works for a top-down camera where the hand can point any direction.
+    """
+    wrist = lm.landmark[0]
+    def dist(i):
+        p = lm.landmark[i]
+        return ((p.x - wrist.x) ** 2 + (p.y - wrist.y) ** 2) ** 0.5
+    tips = [4, 8, 12, 16, 20]
+    pips = [3, 6, 10, 14, 18]
+    return [dist(t) > dist(p) for t, p in zip(tips, pips)]
+
+
+def is_peace_sign(lm):
+    """True if the hand shows a V: index + middle up, ring + pinky down."""
+    f = _fingers_extended(lm)
+    return f[1] and f[2] and (not f[3]) and (not f[4])
+
+
+def detect_zone_and_gesture(frame, danger_zone, caution_zone, handoff_zone, draw=True):
+    """
+    Like detect_zone(), but ALSO reports a peace-sign gesture in a single
+    MediaPipe pass (no extra CPU cost).
+
+    Returns (zone, peace_sign, hand_side, annotated_frame):
+        zone        one of "DANGER"/"HANDOFF"/"WARNING"/"NONE"
+        peace_sign  True if any hand makes a V sign
+        hand_side   "left"/"right" — which half of the frame that hand is in
+                    (None if no peace sign). Used to wave toward the worker.
+    """
+    fh, fw = frame.shape[:2]
+    if PROCESS_WIDTH and fw > PROCESS_WIDTH:
+        scale = PROCESS_WIDTH / fw
+        small = cv2.resize(frame, (PROCESS_WIDTH, int(fh * scale)))
+    else:
+        small = frame
+    small = enhance_contrast(small)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+    result = hands.process(rgb)
+
+    all_zones = []
+    peace = False
+    side = None
+    if result.multi_hand_landmarks:
+        for lm in result.multi_hand_landmarks:
+            if draw:
+                mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
+            for tip_idx in HAND_FINGERTIPS:
+                tx = int(lm.landmark[tip_idx].x * fw)
+                ty = int(lm.landmark[tip_idx].y * fh)
+                if (danger_zone[0] <= tx <= danger_zone[2]
+                        and danger_zone[1] <= ty <= danger_zone[3]):
+                    all_zones.append("DANGER")
+                elif (handoff_zone[0] <= tx <= handoff_zone[2]
+                        and handoff_zone[1] <= ty <= handoff_zone[3]):
+                    all_zones.append("HANDOFF")
+                elif (caution_zone[0] <= tx <= caution_zone[2]
+                        and caution_zone[1] <= ty <= caution_zone[3]):
+                    all_zones.append("WARNING")
+                if draw:
+                    cv2.circle(frame, (tx, ty), 4, (255, 255, 255), -1)
+            if is_peace_sign(lm):
+                peace = True
+                side = "left" if lm.landmark[0].x < 0.5 else "right"
+                if draw:
+                    wx = int(lm.landmark[0].x * fw)
+                    wy = int(lm.landmark[0].y * fh)
+                    cv2.putText(frame, "PEACE / PAUSE", (wx - 30, wy - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    if "DANGER" in all_zones:
+        zone = "DANGER"
+    elif "HANDOFF" in all_zones:
+        zone = "HANDOFF"
+    elif "WARNING" in all_zones:
+        zone = "WARNING"
+    else:
+        zone = "NONE"
+    return zone, peace, side, frame
+
+
+# ─────────────────────────────────────────────────────────
 # Everything below is the STANDALONE demo. Only runs when this file is
 # executed directly (`python hand_detection.py`), NOT when imported.
 # ─────────────────────────────────────────────────────────
