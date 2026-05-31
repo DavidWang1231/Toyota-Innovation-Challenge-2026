@@ -8,7 +8,6 @@ request. The UI is a single self-contained HTML page.
 Run:  python3 launcher.py
 Then your browser opens at http://127.0.0.1:8765
 """
-import os
 import json
 import sys
 import threading
@@ -65,7 +64,7 @@ TOOLS = [
         "desc":    "Drive the robot arm manually to find or recover positions.",
         "color":   "green",
         "actions": [
-            {"label": "Launch", "file": "manualControl.py"},
+            {"label": "Launch", "file": "runManual.py"},
         ],
     },
 ]
@@ -98,13 +97,7 @@ def _launch_file(filename) -> tuple[bool, str]:
         return False, "Already running"
     cmd = [sys.executable, str(path)] + action.get("args", [])
     try:
-        logf = open(SCRIPT_DIR / (filename + ".log"), "w",
-                    encoding="utf-8", errors="replace")
-        env = dict(os.environ)
-        env["PYTHONUTF8"] = "1"          # force child to encode output as UTF-8
-        env["PYTHONIOENCODING"] = "utf-8"  # so '✓', '→' etc. don't crash on GBK
-        proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR),
-                                stdout=logf, stderr=subprocess.STDOUT, env=env)
+        proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR))
         with _proc_lock:
             _processes[filename] = proc
         return True, "Launched"
