@@ -814,7 +814,7 @@ HTML = """<!DOCTYPE html>
   <!-- Bottom status (centered across whole window) -->
   <div class="meta">
     <span class="status-dot"></span>
-    System Online · Collaborative Robotics · 127.0.0.1
+    Justin Fang · David Wang · Steven Qi · Heidi Wang
   </div>
 </div>
 
