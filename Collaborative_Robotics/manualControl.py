@@ -43,14 +43,24 @@ import numpy as np
 # How far the arm moves per key press. SMALL so each tap is a nudge — the
 # queued model means held-down keys still travel quickly.
 # ---------------------------------------------------------------------------
-STEP_XY = 6      # mm per press for W/S/A/D
-STEP_Z  = 6      # mm per press for Q/E
-STEP_R  = 10     # degrees per press for Z/C
+STEP_XY = 4      # mm per press for W/S/A/D  (small = precise single taps)
+STEP_Z  = 4      # mm per press for Q/E
+STEP_R  = 5      # degrees per press for Z/C
 
-# Cap on how many moves can sit in the Dobot's queue. If you tap faster
-# than the arm can execute, additional keys are DROPPED until the queue
-# drains. Without this cap the arm would overshoot badly after you let go.
-MAX_PENDING = 3
+# Cap on how many moves can sit in the Dobot's queue. With small steps,
+# we WANT a deep queue: holding a key fires keys at the OS repeat rate
+# (~30/sec), and the arm chains the small moves into smooth continuous
+# motion as long as the queue stays full. Lower this only if you find
+# the arm keeps moving for too long after you release the key.
+MAX_PENDING = 12
+
+# Speed/accel pushed to the queue on entry. 100/80 matches initialize_robot.
+MANUAL_VEL = 100
+MANUAL_ACC = 100
+# Per-axis Cartesian speed for XYZ moves. The Magician's practical max is
+# ~200 mm/s. Higher = arm moves faster between waypoints.
+MANUAL_COORD_VEL = 250
+MANUAL_COORD_ACC = 250
 
 # ---------------------------------------------------------------------------
 # Soft limits — stop the arm from being driven somewhere that hits the table
@@ -58,7 +68,7 @@ MAX_PENDING = 3
 # ---------------------------------------------------------------------------
 X_MIN, X_MAX = 100, 320
 Y_MIN, Y_MAX = -150, 200
-Z_MIN, Z_MAX = -45, 120
+Z_MIN, Z_MAX = -70, 120
 R_MIN, R_MAX = -90, 90
 
 
@@ -132,10 +142,17 @@ def manual_control_loop(api, cap, window_name="Detection"):
     print("\n[MANUAL] Manual control ON. WASD/QE/ZC to move, M to exit, Esc to quit.")
 
     # Make sure the queue is actually executing — we send isQueued=1 commands.
+    # Also force max speed/accel in case auto-mode left it on SLOW (30/30)
+    # after a WARNING zone slowdown.
     try:
+        dType.SetPTPCommonParams(api, MANUAL_VEL, MANUAL_ACC, isQueued=0)
+        dType.SetPTPCoordinateParams(api,
+                                     MANUAL_COORD_VEL, MANUAL_COORD_VEL,
+                                     MANUAL_COORD_ACC, MANUAL_COORD_ACC,
+                                     isQueued=0)
         dType.SetQueuedCmdStartExec(api)
     except Exception as err:
-        print(f"[MANUAL] Could not start queued exec: {err}")
+        print(f"[MANUAL] Could not set speed / start queued exec: {err}")
 
     # Seed target pose from where the arm actually is right now. After this
     # we increment the TARGET (not the live pose) on each keypress, so taps
